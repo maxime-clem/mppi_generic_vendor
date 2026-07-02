@@ -1,0 +1,2 @@
+# This variable will be exposed to any package that finds this vendor package
+set(mppi_generic_vendor_SKIP_BUILD @SKIP_BUILD@)

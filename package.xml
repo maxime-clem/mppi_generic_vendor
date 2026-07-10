@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>MPPI-Generic</name>
+  <name>mppi_generic</name>
   <version>0.1.0</version>
-  <description>GPU MPPI controller library (MPPI-Generic)</description>
+  <description>GPU MPPI controller library (mppi_generic)</description>
 
   <maintainer email="arjun.ram@tier4.jp">Arjun Jagdish Ram</maintainer>
   <license>BSD-2-Clause</license>

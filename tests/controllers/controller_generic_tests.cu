@@ -219,21 +219,20 @@ TEST_F(ControllerTests, smoothControlTrajectory)
   Eigen::Matrix<float, MockDynamics::CONTROL_DIM, 2> control_history =
       Eigen::Matrix<float, MockDynamics::CONTROL_DIM, 2>::Zero();
 
-  // smooth using only one value from the control trajectory
+  // u[0] is preserved; left edge replicates u[0] for i >= 1.
   controller->setNumTimesteps(1);
   controller->smoothControlTrajectoryHelper(u, control_history);
   for (int i = 0; i < MockDynamics::CONTROL_DIM; i++)
   {
-    EXPECT_FLOAT_EQ(u(i, 0), (1.0 * 17 + 1.0 * 12 + 1.0 * -3) / 35.0) << "i = " << i;
+    EXPECT_FLOAT_EQ(u(i, 0), 1.0F) << "i = " << i;
   }
-  // Reset trajectory and smooth over two steps
   u.col(0) = TestController::control_array::Ones();
   controller->setNumTimesteps(2);
   controller->smoothControlTrajectoryHelper(u, control_history);
   for (int i = 0; i < MockDynamics::CONTROL_DIM; i++)
   {
-    EXPECT_FLOAT_EQ(u(i, 0), (1.0 * 17 + 2.0 * 12 + 2.0 * -3) / 35.0) << "i = " << i;
-    EXPECT_FLOAT_EQ(u(i, 1), (1.0 * 12 + 2.0 * 17 + 2.0 * 12 + 2.0 * -3) / 35.0) << "i = " << i;
+    EXPECT_FLOAT_EQ(u(i, 0), 1.0F) << "i = " << i;
+    EXPECT_FLOAT_EQ(u(i, 1), 61.0F / 35.0F) << "i = " << i;
   }
 }
 

@@ -133,6 +133,7 @@ public:
 
     control_ = init_control_traj;
     control_history_ = Eigen::Matrix<float, DYN_T::CONTROL_DIM, 2>::Zero();
+    last_pre_smooth_control_ = control_array::Zero();
 
     // Bind the model and control to the given stream
     setCUDAStream(stream);
@@ -166,6 +167,7 @@ public:
     setParams(params);
     control_ = params_.init_control_traj_;
     control_history_ = Eigen::Matrix<float, DYN_T::CONTROL_DIM, 2>::Zero();
+    last_pre_smooth_control_ = control_array::Zero();
 
     // Bind the model and control to the given stream
     setCUDAStream(stream);
@@ -571,8 +573,8 @@ public:
   void smoothControlTrajectoryHelper(Eigen::Ref<control_trajectory> u,
                                      const Eigen::Ref<Eigen::Matrix<float, DYN_T::CONTROL_DIM, 2>>& control_history)
   {
-    // TODO generalize to any size filter
-    // TODO does the logic of handling control history reasonable?
+    // Store pre-filter u[0]; slideControlSequence must not save post-filter values into history.
+    last_pre_smooth_control_ = u.col(0);
 
     // Create the filter coefficients
     Eigen::Matrix<float, 1, 5> filter_coefficients;
@@ -582,8 +584,12 @@ public:
     // Create and fill a control buffer that we can apply the convolution filter
     Eigen::MatrixXf control_buffer(getNumTimesteps() + 4, DYN_T::CONTROL_DIM);
 
-    // Fill the first two timesteps with the control history
-    control_buffer.topRows(2) = control_history.transpose();
+    // MPPI re-optimizes the full horizon each cycle; cross-cycle control_history_ only
+    // couples stale commands into u[0] (~26/35 attenuation when history is zero). Replicate
+    // u[0] on the left, mirroring the terminal padding on the right.
+    (void)control_history;
+    control_buffer.row(0) = u.col(0).transpose();
+    control_buffer.row(1) = u.col(0).transpose();
 
     // Fill the center timesteps with the current nominal trajectory
     control_buffer.middleRows(2, getNumTimesteps()) = u.transpose();
@@ -592,8 +598,9 @@ public:
     control_buffer.row(getNumTimesteps() + 2) = u.transpose().row(getNumTimesteps() - 1);
     control_buffer.row(getNumTimesteps() + 3) = u.transpose().row(getNumTimesteps() - 1);
 
-    // Apply convolutional filter to each timestep
-    for (int i = 0; i < getNumTimesteps(); ++i)
+    // Keep u[0] as the optimizer output (applied command). Filtering it with left-edge
+    // padding still biases the first sample every replan.
+    for (int i = 1; i < getNumTimesteps(); ++i)
     {
       u.col(i) = (filter_coefficients * control_buffer.middleRows(i, 5)).transpose();
     }
@@ -619,7 +626,7 @@ public:
     if (steps == 1)
     {  // We only moved one timestep
       u_history.col(0) = u_history.col(1);
-      u_history.col(1) = u_trajectory.col(0);
+      u_history.col(1) = last_pre_smooth_control_;
     }
     else if (steps >= 2)
     {  // We have moved more than one timestep, but our history size is still only 2
@@ -975,6 +982,8 @@ protected:
   float* vis_initial_state_d_;  // Array of sizae DYN_T::STATE_DIM * (2 if there is a nominal state)
 
   Eigen::Matrix<float, DYN_T::CONTROL_DIM, 2> control_history_;
+  /** Pre-Savitzky–Golay u[0] from the latest computeControl; used for control_history_ on slide. */
+  control_array last_pre_smooth_control_ = control_array::Zero();
 
   // one array of this size is allocated for each state we care about,
   // so it can be the size*N for N nominal states

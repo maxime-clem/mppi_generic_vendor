@@ -11,19 +11,41 @@ namespace mppi
 {
 namespace kernels
 {
+/** Scalar statistics produced by the fused rollout cost-normalization/weight kernel. */
+struct CostWeightStats
+{
+  /** Minimum and maximum finite raw rollout costs. */
+  float rollout_min_cost = 0.0F;
+  float min_cost = 0.0F;
+  float max_cost = 0.0F;
+  /** Robust upper cost used as the normalization scale (normally the 95th percentile). */
+  float normalization_upper_cost = 0.0F;
+  /** Sum of exponential weights before they are normalized in-place. */
+  float normalizer = 0.0F;
+  float squared_weight_sum = 0.0F;
+  float effective_sample_size = 0.0F;
+  /** First and second moments include finite raw rollout costs only. */
+  float raw_cost_sum = 0.0F;
+  float raw_cost_squared_sum = 0.0F;
+  /** Fraction of rollouts whose cost function reported a collision/safety violation. */
+  float unsafe_rollout_fraction = 0.0F;
+};
+
 /*******************************************************************************************************************
  * Kernel functions
  *******************************************************************************************************************/
 template <class COST_T, class SAMPLING_T, bool COALESCE = true>
 __global__ void rolloutCostKernel(COST_T* __restrict__ costs, SAMPLING_T* __restrict__ sampling, float dt,
                                   const int num_timesteps, const int num_rollouts, float lambda, float alpha,
-                                  const float* __restrict__ y_d, float* __restrict__ trajectory_costs_d);
+                                  const float* __restrict__ y_d, float* __restrict__ trajectory_costs_d,
+                                  int* __restrict__ rollout_crash_status_d);
 
 template <class DYN_T, class COST_T, class SAMPLING_T>
 __global__ void rolloutKernel(DYN_T* __restrict__ dynamics, SAMPLING_T* __restrict__ sampling,
                               COST_T* __restrict__ costs, float dt, const int num_timesteps, const int num_rollouts,
                               const float* __restrict__ init_x_d, float lambda, float alpha,
-                              float* __restrict__ trajectory_costs_d);
+                              float* __restrict__ trajectory_costs_d,
+                              int* __restrict__ rollout_crash_status_d);
 
 template <class DYN_T, class SAMPLING_T>
 __global__ void rolloutDynamicsKernel(DYN_T* __restrict__ dynamics, SAMPLING_T* __restrict__ sampling, float dt,
@@ -94,6 +116,12 @@ __device__ void loadGlobalToShared(const int num_rollouts, const int blocksize_y
  *
  * @return
  */
+template <class COST_T>
+__device__ void computeAndSaveCost(int num_rollouts, int num_timesteps, int global_idx, COST_T* costs, float* x_thread,
+                                   float running_cost, float* theta_c, int* crash_status,
+                                   float* cost_rollouts_device, int* rollout_crash_status_device);
+
+/** Compatibility overload for controllers that do not consume rollout-level safety flags. */
 template <class COST_T>
 __device__ void computeAndSaveCost(int num_rollouts, int num_timesteps, int global_idx, COST_T* costs, float* x_thread,
                                    float running_cost, float* theta_c, float* cost_rollouts_device);
@@ -208,13 +236,15 @@ void launchSplitRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__
                               SAMPLING_T* __restrict__ sampling, float dt, const int num_timesteps,
                               const int num_rollouts, float lambda, float alpha, float* __restrict__ init_x_d,
                               float* __restrict__ y_d, float* __restrict__ trajectory_costs, dim3 dimDynBlock,
-                              dim3 dimCostBlock, cudaStream_t stream, bool synchronize = true);
+                              dim3 dimCostBlock, cudaStream_t stream, bool synchronize = true,
+                              int* __restrict__ rollout_crash_status_d = nullptr);
 
 template <class DYN_T, class COST_T, typename SAMPLING_T>
 void launchRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__ costs, SAMPLING_T* __restrict__ sampling,
                          float dt, const int num_timesteps, const int num_rollouts, float lambda, float alpha,
                          float* __restrict__ init_x_d, float* __restrict__ trajectory_costs, dim3 dimBlock,
-                         cudaStream_t stream, bool synchronize = true);
+                         cudaStream_t stream, bool synchronize = true,
+                         int* __restrict__ rollout_crash_status_d = nullptr);
 
 template <class COST_T, class SAMPLING_T, bool COALESCE = true>
 void launchVisualizeCostKernel(COST_T* __restrict__ costs, SAMPLING_T* __restrict__ sampling, float dt,
@@ -238,6 +268,16 @@ void launchWeightedReductionKernel(const float* __restrict__ exp_costs_d, const 
 
 void launchNormExpKernel(int num_rollouts, int blocksize_x, float* trajectory_costs_d, float lambda_inv, float baseline,
                          cudaStream_t stream, bool synchronize = true);
+
+/**
+ * Robust-percentile normalize raw rollout costs, replace them with normalized exponential weights,
+ * and compute the weight, raw-cost, and rollout-safety statistics in one kernel launch.
+ */
+void launchMinMaxWeightKernel(int num_rollouts, int blocksize_x, float* trajectory_costs_d,
+                              const int* rollout_crash_status_d, float lambda_inv,
+                              float normalization_percentile, float range_epsilon,
+                              CostWeightStats* stats_d, cudaStream_t stream,
+                              bool synchronize = true);
 
 void launchTsallisKernel(int num_rollouts, int blocksize_x, float* trajectory_costs_d, float gamma, float r,
                          float baseline, cudaStream_t stream, bool synchronize = true);

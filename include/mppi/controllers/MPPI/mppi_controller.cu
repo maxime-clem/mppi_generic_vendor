@@ -2,6 +2,7 @@
 #include <mppi/controllers/MPPI/mppi_controller.cuh>
 #include <mppi/core/mppi_common.cuh>
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -104,7 +105,7 @@ void VanillaMPPI::chooseAppropriateKernel()
     mppi::kernels::launchRolloutKernel<DYN_T, COST_T, SAMPLING_T>(
         this->model_, this->cost_, this->sampler_, this->getDt(), this->getNumTimesteps(), NUM_ROLLOUTS,
         this->getLambda(), this->getAlpha(), this->initial_state_d_, this->trajectory_costs_d_,
-        this->params_.dynamics_rollout_dim_, this->stream_, true);
+        this->params_.dynamics_rollout_dim_, this->stream_, true, rollout_crash_status_d_);
   }
   auto end_single_kernel_time = std::chrono::steady_clock::now();
   auto start_split_kernel_time = std::chrono::steady_clock::now();
@@ -113,7 +114,8 @@ void VanillaMPPI::chooseAppropriateKernel()
     mppi::kernels::launchSplitRolloutKernel<DYN_T, COST_T, SAMPLING_T>(
         this->model_, this->cost_, this->sampler_, this->getDt(), this->getNumTimesteps(), NUM_ROLLOUTS,
         this->getLambda(), this->getAlpha(), this->initial_state_d_, this->output_d_, this->trajectory_costs_d_,
-        this->params_.dynamics_rollout_dim_, this->params_.cost_rollout_dim_, this->stream_, true);
+        this->params_.dynamics_rollout_dim_, this->params_.cost_rollout_dim_, this->stream_, true,
+        rollout_crash_status_d_);
   }
   auto end_split_kernel_time = std::chrono::steady_clock::now();
 
@@ -145,7 +147,49 @@ void VanillaMPPI::chooseAppropriateKernel()
 VANILLA_MPPI_TEMPLATE
 VanillaMPPI::~VanillaMPPIController()
 {
-  // all implemented in standard controller
+  if (weight_stats_d_ != nullptr)
+  {
+    HANDLE_ERROR(cudaFree(weight_stats_d_));
+    weight_stats_d_ = nullptr;
+  }
+  if (weight_stats_h_ != nullptr)
+  {
+    HANDLE_ERROR(cudaFreeHost(weight_stats_h_));
+    weight_stats_h_ = nullptr;
+  }
+  if (rollout_crash_status_d_ != nullptr)
+  {
+    HANDLE_ERROR(cudaFree(rollout_crash_status_d_));
+    rollout_crash_status_d_ = nullptr;
+  }
+}
+
+VANILLA_MPPI_TEMPLATE
+void VanillaMPPI::configureEssLambdaAdaptation(float target_ess_ratio, float adaptation_gain,
+                                               float lambda_min, float lambda_max,
+                                               float unsafe_rollout_fraction_threshold,
+                                               float cost_normalization_percentile)
+{
+  target_ess_ratio_ = std::max(0.0F, std::min(1.0F, target_ess_ratio));
+  lambda_adaptation_gain_ = std::max(0.0F, adaptation_gain);
+  lambda_min_ = std::max(1.0E-6F, lambda_min);
+  lambda_max_ = std::max(lambda_min_, lambda_max);
+  unsafe_rollout_fraction_threshold_ =
+      std::max(0.0F, std::min(1.0F, unsafe_rollout_fraction_threshold));
+  cost_normalization_percentile_ =
+      std::max(0.0F, std::min(1.0F, cost_normalization_percentile));
+  lambda_adaptation_enabled_ = true;
+  last_weight_lambda_ = std::max(lambda_min_, std::min(lambda_max_, this->getLambda()));
+  last_iteration_weight_lambda_ = last_weight_lambda_;
+  this->setLambda(last_weight_lambda_);
+}
+
+VANILLA_MPPI_TEMPLATE
+void VanillaMPPI::downloadImportanceWeightsToHost()
+{
+  HANDLE_ERROR(cudaMemcpyAsync(this->trajectory_costs_.data(), this->trajectory_costs_d_,
+                               NUM_ROLLOUTS * sizeof(float), cudaMemcpyDeviceToHost, this->stream_));
+  HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
 }
 
 VANILLA_MPPI_TEMPLATE
@@ -157,10 +201,29 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
   HANDLE_ERROR(cudaMemcpyAsync(this->initial_state_d_, state.data(), DYN_T::STATE_DIM * sizeof(float),
                                cudaMemcpyHostToDevice, this->stream_));
 
-  float baseline_prev = 1e8;
+  const float rollout_count = std::max(static_cast<float>(NUM_ROLLOUTS), 1.0F);
+  float baseline_prev = std::isfinite(this->free_energy_statistics_.real_sys.previousBaseline)
+                            ? this->free_energy_statistics_.real_sys.previousBaseline
+                            : 0.0F;
+  iteration_effective_sample_sizes_.clear();
+  iteration_effective_sample_sizes_.reserve(
+      static_cast<std::size_t>(this->getNumIters()));
+  // Apply the temperature prepared by the previous control step before entering the optimization
+  // loop; it then remains fixed for every iteration in this step.
+  if (lambda_adaptation_enabled_)
+  {
+    last_weight_lambda_ = std::max(lambda_min_, std::min(lambda_max_, last_weight_lambda_));
+  }
+  else
+  {
+    last_weight_lambda_ = std::max(1.0E-6F, this->getLambda());
+  }
+  last_iteration_weight_lambda_ = last_weight_lambda_;
+  this->setLambda(last_weight_lambda_);
 
   for (int opt_iter = 0; opt_iter < this->getNumIters(); opt_iter++)
   {
+    last_iteration_weight_lambda_ = last_weight_lambda_;
     // Send the nominal control to the device
     this->copyNominalControlToDevice(false);
 
@@ -173,53 +236,98 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
       mppi::kernels::launchSplitRolloutKernel<DYN_T, COST_T, SAMPLING_T>(
           this->model_, this->cost_, this->sampler_, this->getDt(), this->getNumTimesteps(), NUM_ROLLOUTS,
           this->getLambda(), this->getAlpha(), this->initial_state_d_, this->output_d_, this->trajectory_costs_d_,
-          this->params_.dynamics_rollout_dim_, this->params_.cost_rollout_dim_, this->stream_, false);
+          this->params_.dynamics_rollout_dim_, this->params_.cost_rollout_dim_, this->stream_, false,
+          rollout_crash_status_d_);
     }
     else if (this->getKernelChoiceAsEnum() == kernelType::USE_SINGLE_KERNEL)
     {
       mppi::kernels::launchRolloutKernel<DYN_T, COST_T, SAMPLING_T>(
           this->model_, this->cost_, this->sampler_, this->getDt(), this->getNumTimesteps(), NUM_ROLLOUTS,
           this->getLambda(), this->getAlpha(), this->initial_state_d_, this->trajectory_costs_d_,
-          this->params_.dynamics_rollout_dim_, this->stream_, false);
+          this->params_.dynamics_rollout_dim_, this->stream_, false, rollout_crash_status_d_);
     }
 
-    // Copy the costs back to the host
-    HANDLE_ERROR(cudaMemcpyAsync(this->trajectory_costs_.data(), this->trajectory_costs_d_,
-                                 NUM_ROLLOUTS * sizeof(float), cudaMemcpyDeviceToHost, this->stream_));
-    HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
+    // Preserve raw rollout costs only for explicitly enabled per-iteration diagnostics.
+    if (requiresRawRolloutCostsForIteration())
+    {
+      HANDLE_ERROR(cudaMemcpyAsync(this->trajectory_costs_.data(), this->trajectory_costs_d_,
+                                   NUM_ROLLOUTS * sizeof(float), cudaMemcpyDeviceToHost, this->stream_));
+      HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
+      optimizationIterationComplete(opt_iter);
+    }
 
-    this->setBaseline(mppi::kernels::computeBaselineCost(this->trajectory_costs_.data(), NUM_ROLLOUTS));
+    // One device kernel computes robust-normalized exponential weights, the weight normalizer,
+    // ESS, and safety statistics. Only this scalar record crosses back to the host.
+    mppi::kernels::launchMinMaxWeightKernel(
+        NUM_ROLLOUTS, this->getNormExpThreads(), this->trajectory_costs_d_,
+        rollout_crash_status_d_, 1.0F / last_iteration_weight_lambda_,
+        cost_normalization_percentile_, 1.0E-6F, weight_stats_d_, this->stream_, false);
+    // The fused kernel normalizes weights in-place; sampler reduction therefore uses unity.
+    this->setNormalizer(1.0F);
 
-    if (this->getBaselineCost() > baseline_prev + 1)
+    this->sampler_->updateDistributionParamsFromDevice(this->trajectory_costs_d_, 1.0F, 0, false);
+    HANDLE_ERROR(cudaMemcpyAsync(weight_stats_h_, weight_stats_d_, sizeof(*weight_stats_h_),
+                                 cudaMemcpyDeviceToHost, this->stream_));
+
+    // Transfer the new control to the host. Its existing stream synchronization also completes
+    // the preceding pinned statistics transfer, avoiding a second per-iteration barrier.
+    this->sampler_->setHostOptimalControlSequence(this->control_.data(), 0, true);
+
+    // Keep the controller baseline absolute and current, but protect against all-failed rollouts
+    if (weight_stats_h_->rollout_min_cost < FLT_MAX)
+    {
+      this->setBaseline(weight_stats_h_->rollout_min_cost);
+    }
+    iteration_effective_sample_sizes_.push_back(weight_stats_h_->effective_sample_size);
+
+    if (this->getBaselineCost() > baseline_prev + 1.0F)
     {
       this->logger_->debug("Previous Baseline: %f\n         Baseline: %f\n", baseline_prev, this->getBaselineCost());
     }
-
     baseline_prev = this->getBaselineCost();
 
-    // Launch the norm exponential kernel
-    mppi::kernels::launchNormExpKernel(NUM_ROLLOUTS, this->getNormExpThreads(), this->trajectory_costs_d_,
-                                       1.0 / this->getLambda(), this->getBaselineCost(), this->stream_, false);
-    HANDLE_ERROR(cudaMemcpyAsync(this->trajectory_costs_.data(), this->trajectory_costs_d_,
-                                 NUM_ROLLOUTS * sizeof(float), cudaMemcpyDeviceToHost, this->stream_));
-    HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
+    const float mean_weight = weight_stats_h_->normalizer / rollout_count;
+    this->free_energy_statistics_.real_sys.freeEnergyMean =
+        -last_iteration_weight_lambda_ * std::log(std::max(mean_weight, 1.0E-12F));
 
-    // Compute the normalizer
-    this->setNormalizer(mppi::kernels::computeNormalizer(this->trajectory_costs_.data(), NUM_ROLLOUTS));
+    const float mean_raw_cost = weight_stats_h_->raw_cost_sum / rollout_count;
+    const float mean_squared_raw_cost =
+        weight_stats_h_->raw_cost_squared_sum / rollout_count;
+    this->free_energy_statistics_.real_sys.freeEnergyVariance = std::max(
+        0.0F, mean_squared_raw_cost - mean_raw_cost * mean_raw_cost);
+    const float variance_scale =
+        this->free_energy_statistics_.real_sys.freeEnergyVariance /
+        std::max(std::abs(mean_raw_cost) * std::sqrt(rollout_count), 1.0E-12F);
+    this->free_energy_statistics_.real_sys.freeEnergyModifiedVariance =
+        last_iteration_weight_lambda_ *
+        (variance_scale + 0.5F * variance_scale * variance_scale);
 
-    mppi::kernels::computeFreeEnergy(this->free_energy_statistics_.real_sys.freeEnergyMean,
-                                     this->free_energy_statistics_.real_sys.freeEnergyVariance,
-                                     this->free_energy_statistics_.real_sys.freeEnergyModifiedVariance,
-                                     this->trajectory_costs_.data(), NUM_ROLLOUTS, this->getBaselineCost(),
-                                     this->getLambda());
-
-    this->sampler_->updateDistributionParamsFromDevice(this->trajectory_costs_d_, this->getNormalizerCost(), 0, false);
-
-    // Transfer the new control to the host
-    this->sampler_->setHostOptimalControlSequence(this->control_.data(), 0, true);
+    // Adapt only from the converged iteration, and retain the result for the next control step.
+    // Keep params_.lambda_ unchanged so every iteration and post-step visualization in this
+    // control cycle uses the same temperature.
+    if (lambda_adaptation_enabled_ && opt_iter == this->getNumIters() - 1 &&
+        !iteration_effective_sample_sizes_.empty())
+    {
+      if (weight_stats_h_->unsafe_rollout_fraction >= unsafe_rollout_fraction_threshold_)
+      {
+        // Panic melt only when the rollout population itself reports unavoidable safety contact.
+        last_weight_lambda_ = lambda_max_;
+      }
+      else
+      {
+        const float ess_ratio = iteration_effective_sample_sizes_.back() / rollout_count;
+        const float error = target_ess_ratio_ - ess_ratio;
+        const float lambda_multiplier = std::exp(lambda_adaptation_gain_ * error);
+        last_weight_lambda_ = std::max(
+            lambda_min_, std::min(lambda_max_, last_weight_lambda_ * lambda_multiplier));
+      }
+    }
   }
 
-  this->free_energy_statistics_.real_sys.normalizerPercent = this->getNormalizerCost() / NUM_ROLLOUTS;
+  this->free_energy_statistics_.real_sys.normalizerPercent =
+      iteration_effective_sample_sizes_.empty()
+          ? 0.0F
+          : iteration_effective_sample_sizes_.back() / rollout_count;
   this->free_energy_statistics_.real_sys.increase =
       this->getBaselineCost() - this->free_energy_statistics_.real_sys.previousBaseline;
   smoothControlTrajectory();
@@ -237,6 +345,10 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
     HANDLE_ERROR(cudaMemcpyAsync(this->vis_initial_state_d_, this->initial_state_d_, sizeof(float) * DYN_T::STATE_DIM,
                                  cudaMemcpyDeviceToDevice, this->vis_stream_));
   }
+  if (this->num_top_control_trajectories_ > 0)
+  {
+    downloadImportanceWeightsToHost();
+  }
   this->copyTopControlFromDevice(true);
 }
 
@@ -244,6 +356,10 @@ VANILLA_MPPI_TEMPLATE
 void VanillaMPPI::allocateCUDAMemory()
 {
   PARENT_CLASS::allocateCUDAMemoryHelper();
+  HANDLE_ERROR(cudaMalloc((void**)&weight_stats_d_, sizeof(mppi::kernels::CostWeightStats)));
+  HANDLE_ERROR(cudaMalloc((void**)&rollout_crash_status_d_, NUM_ROLLOUTS * sizeof(int)));
+  HANDLE_ERROR(cudaMallocHost((void**)&weight_stats_h_, sizeof(mppi::kernels::CostWeightStats)));
+  *weight_stats_h_ = {};
 }
 
 VANILLA_MPPI_TEMPLATE

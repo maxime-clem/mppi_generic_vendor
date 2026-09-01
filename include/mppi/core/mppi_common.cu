@@ -4,6 +4,8 @@
 #include <mppi/utils/math_utils.h>
 #include <mppi/utils/cuda_math_utils.cuh>
 
+#include <cfloat>
+
 // CUDA barriers were first implemented in CUDA 11
 #if defined(CMAKE_USE_CUDA_BARRIERS) && defined(CUDART_VERSION) && CUDART_VERSION > 11000
 #include <cuda/barrier>
@@ -36,7 +38,8 @@ template <class DYN_T, class COST_T, class SAMPLING_T>
 __global__ void rolloutKernel(DYN_T* __restrict__ dynamics, SAMPLING_T* __restrict__ sampling,
                               COST_T* __restrict__ costs, float dt, const int num_timesteps, const int num_rollouts,
                               const float* __restrict__ init_x_d, float lambda, float alpha,
-                              float* __restrict__ trajectory_costs_d)
+                              float* __restrict__ trajectory_costs_d,
+                              int* __restrict__ rollout_crash_status_d)
 {
   // Get thread and block id
   const int thread_idx = threadIdx.x;
@@ -149,13 +152,14 @@ __global__ void rolloutKernel(DYN_T* __restrict__ dynamics, SAMPLING_T* __restri
   costArrayReduction(running_cost, blockDim.y, thread_idy, blockDim.y, thread_idy == 0, blockDim.x);
   // Compute terminal cost and the final cost for each thread
   computeAndSaveCost(num_rollouts, num_timesteps, global_idx, costs, y, running_cost[0] / (num_timesteps),
-                     theta_c_shared, trajectory_costs_d);
+                     theta_c_shared, crash_status, trajectory_costs_d, rollout_crash_status_d);
 }
 
 template <class COST_T, class SAMPLING_T, bool COALESCE>
 __global__ void rolloutCostKernel(COST_T* __restrict__ costs, SAMPLING_T* __restrict__ sampling, float dt,
                                   const int num_timesteps, const int num_rollouts, float lambda, float alpha,
-                                  const float* __restrict__ y_d, float* __restrict__ trajectory_costs_d)
+                                  const float* __restrict__ y_d, float* __restrict__ trajectory_costs_d,
+                                  int* __restrict__ rollout_crash_status_d)
 {
   // Get thread and block id
   const int thread_idx = threadIdx.x;
@@ -257,6 +261,18 @@ __global__ void rolloutCostKernel(COST_T* __restrict__ costs, SAMPLING_T* __rest
   __syncthreads();
   costArrayReduction(running_cost, blockDim.x * blockDim.y, thread_idx + blockDim.x * thread_idy,
                      blockDim.x * blockDim.y, thread_idx == blockDim.x - 1 && thread_idy == 0);
+  // Split-cost threads evaluate different timesteps. Collapse their per-step flags to one flag for
+  // this rollout before saving it with the final cost.
+  if (thread_idx == 0 && thread_idy == 0)
+  {
+    int rollout_crashed = 0;
+    for (int time_thread = 0; time_thread < blockDim.x; ++time_thread)
+    {
+      rollout_crashed |= crash_status_shared[thread_idz * blockDim.x + time_thread];
+    }
+    crash_status_shared[thread_idz * blockDim.x] = rollout_crashed;
+  }
+  __syncthreads();
   // point every thread to the last output at t = NUM_TIMESTEPS for terminal cost calculation
   const int last_y_index = (num_timesteps - 1) % blockDim.x;
   y = &y_shared[(blockDim.x * thread_idz + last_y_index) * COST_T::OUTPUT_DIM];
@@ -270,7 +286,8 @@ __global__ void rolloutCostKernel(COST_T* __restrict__ costs, SAMPLING_T* __rest
 #endif
   // Compute terminal cost and the final cost for each thread
   computeAndSaveCost(num_rollouts, num_timesteps, global_idx, costs, y, running_cost[0] / (num_timesteps), theta_c,
-                     trajectory_costs_d);
+                     &crash_status_shared[thread_idz * blockDim.x], trajectory_costs_d,
+                     rollout_crash_status_d);
 }
 
 template <class DYN_T, class SAMPLING_T>
@@ -849,14 +866,28 @@ __device__ void loadGlobalToShared(const int num_rollouts, const int blocksize_y
 
 template <class COST_T>
 __device__ void computeAndSaveCost(int num_rollouts, int num_timesteps, int global_idx, COST_T* costs, float* output,
-                                   float running_cost, float* theta_c, float* cost_rollouts_device)
+                                   float running_cost, float* theta_c, int* crash_status,
+                                   float* cost_rollouts_device, int* rollout_crash_status_device)
 {
   // only want to save 1 cost per trajectory
   if (threadIdx.y == 0 && global_idx < num_rollouts)
   {
     cost_rollouts_device[global_idx + num_rollouts * threadIdx.z] =
         running_cost + costs->terminalCost(output, theta_c) / (num_timesteps);
+    if (rollout_crash_status_device != nullptr)
+    {
+      rollout_crash_status_device[global_idx + num_rollouts * threadIdx.z] =
+          crash_status != nullptr && crash_status[0] != 0 ? 1 : 0;
+    }
   }
+}
+
+template <class COST_T>
+__device__ void computeAndSaveCost(int num_rollouts, int num_timesteps, int global_idx, COST_T* costs, float* output,
+                                   float running_cost, float* theta_c, float* cost_rollouts_device)
+{
+  computeAndSaveCost(num_rollouts, num_timesteps, global_idx, costs, output, running_cost, theta_c, nullptr,
+                     cost_rollouts_device, nullptr);
 }
 
 /*******************************************************************************************************************
@@ -969,6 +1000,235 @@ __device__ __host__ inline void normExpTransform(int num_rollouts, float* __rest
   {
     float cost_dif = trajectory_costs_d[i] - baseline;
     trajectory_costs_d[i] = expf(-lambda_inv * cost_dif);
+  }
+}
+
+/**
+ * Fused raw-cost reduction, robust-percentile normalization, exponential transform, safety count,
+ * and first/second weight-moment reduction. A single block loops over the rollout array so all
+ * results remain block-local and the output weights can be consumed directly by the sampler.
+ */
+__global__ void minMaxWeightKernel(int num_rollouts, float* __restrict__ trajectory_costs_d,
+                                   const int* __restrict__ rollout_crash_status_d, float lambda_inv,
+                                   float normalization_percentile, float range_epsilon,
+                                   CostWeightStats* __restrict__ stats_d)
+{
+  extern __shared__ float reduction[];
+  float* min_values = reduction;
+  float* max_values = min_values + blockDim.x;
+  float* raw_cost_sums = max_values + blockDim.x;
+  float* raw_cost_squared_sums = raw_cost_sums + blockDim.x;
+  int* finite_counts = reinterpret_cast<int*>(raw_cost_squared_sums + blockDim.x);
+  __shared__ unsigned int unsafe_rollout_count;
+  __shared__ float quantile_lower;
+  __shared__ float quantile_upper;
+  __shared__ int quantile_rank;
+
+  if (threadIdx.x == 0)
+  {
+    unsafe_rollout_count = 0U;
+  }
+  __syncthreads();
+
+  float local_min = FLT_MAX;
+  float local_max = -FLT_MAX;
+  float local_raw_cost_sum = 0.0F;
+  float local_raw_cost_squared_sum = 0.0F;
+  int local_finite_count = 0;
+  unsigned int local_unsafe_count = 0U;
+  for (int rollout = threadIdx.x; rollout < num_rollouts; rollout += blockDim.x)
+  {
+    const float cost = trajectory_costs_d[rollout];
+    if (isfinite(cost))
+    {
+      local_min = fminf(local_min, cost);
+      local_max = fmaxf(local_max, cost);
+      local_raw_cost_sum += cost;
+      local_raw_cost_squared_sum = fmaf(cost, cost, local_raw_cost_squared_sum);
+      ++local_finite_count;
+    }
+    if (rollout_crash_status_d != nullptr && rollout_crash_status_d[rollout] != 0)
+    {
+      ++local_unsafe_count;
+    }
+  }
+  min_values[threadIdx.x] = local_min;
+  max_values[threadIdx.x] = local_max;
+  raw_cost_sums[threadIdx.x] = local_raw_cost_sum;
+  raw_cost_squared_sums[threadIdx.x] = local_raw_cost_squared_sum;
+  finite_counts[threadIdx.x] = local_finite_count;
+  if (local_unsafe_count != 0U)
+  {
+    atomicAdd(&unsafe_rollout_count, local_unsafe_count);
+  }
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+  {
+    if (threadIdx.x < stride)
+    {
+      min_values[threadIdx.x] = fminf(min_values[threadIdx.x], min_values[threadIdx.x + stride]);
+      max_values[threadIdx.x] = fmaxf(max_values[threadIdx.x], max_values[threadIdx.x + stride]);
+      raw_cost_sums[threadIdx.x] += raw_cost_sums[threadIdx.x + stride];
+      raw_cost_squared_sums[threadIdx.x] += raw_cost_squared_sums[threadIdx.x + stride];
+      finite_counts[threadIdx.x] += finite_counts[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  const bool has_finite_cost = min_values[0] != FLT_MAX;
+  const float min_cost = has_finite_cost ? min_values[0] : 0.0F;
+  const float max_cost = has_finite_cost ? max_values[0] : min_cost;
+  const float raw_cost_sum = raw_cost_sums[0];
+  const float raw_cost_squared_sum = raw_cost_squared_sums[0];
+  const int finite_count = finite_counts[0];
+
+  // Approximate the requested quantile with three successively refined shared-memory histograms.
+  // Unlike a single histogram over [min,max], refinement remains useful when a few collision costs
+  // are orders of magnitude larger than the normal rollout population.
+  constexpr int kQuantileRefinementPasses = 3;
+  unsigned int* quantile_histogram = reinterpret_cast<unsigned int*>(min_values);
+  if (threadIdx.x == 0)
+  {
+    const float bounded_percentile = fmaxf(0.0F, fminf(1.0F, normalization_percentile));
+    quantile_lower = min_cost;
+    quantile_upper = max_cost;
+    quantile_rank = finite_count > 0
+                        ? max(0, min(finite_count - 1,
+                                     static_cast<int>(ceilf(bounded_percentile * finite_count)) - 1))
+                        : 0;
+  }
+  __syncthreads();
+
+  for (int pass = 0; pass < kQuantileRefinementPasses; ++pass)
+  {
+    const float lower = quantile_lower;
+    const float upper = quantile_upper;
+    const float interval = upper - lower;
+    if (!has_finite_cost || !isfinite(interval) || interval < range_epsilon)
+    {
+      break;
+    }
+
+    quantile_histogram[threadIdx.x] = 0U;
+    __syncthreads();
+    for (int rollout = threadIdx.x; rollout < num_rollouts; rollout += blockDim.x)
+    {
+      const float cost = trajectory_costs_d[rollout];
+      if (isfinite(cost) && cost >= lower && cost <= upper)
+      {
+        const float position = (cost - lower) / interval;
+        const int bin = max(0, min(static_cast<int>(blockDim.x) - 1,
+                                   static_cast<int>(position * blockDim.x)));
+        atomicAdd(&quantile_histogram[bin], 1U);
+      }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+      unsigned int cumulative = 0U;
+      int selected_bin = static_cast<int>(blockDim.x) - 1;
+      for (int bin = 0; bin < static_cast<int>(blockDim.x); ++bin)
+      {
+        const unsigned int next = cumulative + quantile_histogram[bin];
+        if (quantile_rank < static_cast<int>(next))
+        {
+          selected_bin = bin;
+          break;
+        }
+        cumulative = next;
+      }
+      quantile_rank = max(0, quantile_rank - static_cast<int>(cumulative));
+      const float bin_width = interval / static_cast<float>(blockDim.x);
+      quantile_lower = lower + static_cast<float>(selected_bin) * bin_width;
+      quantile_upper = selected_bin == static_cast<int>(blockDim.x) - 1
+                           ? upper
+                           : lower + static_cast<float>(selected_bin + 1) * bin_width;
+    }
+    __syncthreads();
+  }
+
+  const float normalization_upper_cost =
+      has_finite_cost ? fmaxf(min_cost, fminf(max_cost, quantile_upper)) : min_cost;
+  const float robust_cost_range = normalization_upper_cost - min_cost;
+  const bool normalize_costs =
+      isfinite(robust_cost_range) && robust_cost_range >= range_epsilon;
+
+  // The min/max reductions are complete, so reuse their shared buffers for the two weight
+  // moments instead of increasing the kernel's shared-memory footprint further.
+  float* weight_sums = min_values;
+  float* squared_weight_sums = max_values;
+  float local_weight_sum = 0.0F;
+  float local_squared_weight_sum = 0.0F;
+  for (int rollout = threadIdx.x; rollout < num_rollouts; rollout += blockDim.x)
+  {
+    const float raw_cost = trajectory_costs_d[rollout];
+    float normalized_cost = 0.0F;
+    if (!isfinite(raw_cost))
+    {
+      // A failed rollout must not become a best sample merely because the finite cost range is
+      // degenerate. If every rollout failed there is no meaningful ordering, so remain uniform.
+      normalized_cost = has_finite_cost ? 1.0F : 0.0F;
+    }
+    else if (normalize_costs)
+    {
+      normalized_cost = (raw_cost - min_cost) / robust_cost_range;
+      normalized_cost = fmaxf(0.0F, fminf(1.0F, normalized_cost));
+    }
+    else if (raw_cost > normalization_upper_cost)
+    {
+      // Preserve rejection of the upper tail when the retained percentile itself is degenerate.
+      normalized_cost = 1.0F;
+    }
+    const float weight = expf(-lambda_inv * normalized_cost);
+    trajectory_costs_d[rollout] = weight;
+    local_weight_sum += weight;
+    local_squared_weight_sum += weight * weight;
+  }
+  weight_sums[threadIdx.x] = local_weight_sum;
+  squared_weight_sums[threadIdx.x] = local_squared_weight_sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+  {
+    if (threadIdx.x < stride)
+    {
+      weight_sums[threadIdx.x] += weight_sums[threadIdx.x + stride];
+      squared_weight_sums[threadIdx.x] += squared_weight_sums[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  const float weight_sum = weight_sums[0];
+  const float inverse_weight_sum = weight_sum > 1.0E-12F ? 1.0F / weight_sum : 0.0F;
+  for (int rollout = threadIdx.x; rollout < num_rollouts; rollout += blockDim.x)
+  {
+    trajectory_costs_d[rollout] *= inverse_weight_sum;
+  }
+
+  if (threadIdx.x == 0)
+  {
+    const float squared_weight_sum = squared_weight_sums[0];
+    float effective_sample_size = static_cast<float>(num_rollouts);
+    if (squared_weight_sum > 1.0E-12F)
+    {
+      effective_sample_size = weight_sum * weight_sum / squared_weight_sum;
+    }
+    stats_d->rollout_min_cost = has_finite_cost ? min_cost : FLT_MAX;
+    stats_d->min_cost = min_cost;
+    stats_d->max_cost = max_cost;
+    stats_d->normalization_upper_cost = normalization_upper_cost;
+    stats_d->normalizer = weight_sum;
+    stats_d->squared_weight_sum = squared_weight_sum;
+    stats_d->effective_sample_size =
+        fmaxf(1.0F, fminf(static_cast<float>(num_rollouts), effective_sample_size));
+    stats_d->raw_cost_sum = raw_cost_sum;
+    stats_d->raw_cost_squared_sum = raw_cost_squared_sum;
+    stats_d->unsafe_rollout_fraction = num_rollouts > 0
+                                          ? static_cast<float>(unsafe_rollout_count) /
+                                                static_cast<float>(num_rollouts)
+                                          : 0.0F;
   }
 }
 
@@ -1268,7 +1528,8 @@ void launchSplitRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__
                               SAMPLING_T* __restrict__ sampling, float dt, const int num_timesteps,
                               const int num_rollouts, float lambda, float alpha, float* __restrict__ init_x_d,
                               float* __restrict__ y_d, float* __restrict__ trajectory_costs, dim3 dimDynBlock,
-                              dim3 dimCostBlock, cudaStream_t stream, bool synchronize)
+                              dim3 dimCostBlock, cudaStream_t stream, bool synchronize,
+                              int* __restrict__ rollout_crash_status_d)
 {
   if (num_rollouts % dimDynBlock.x != 0)
   {
@@ -1295,7 +1556,8 @@ void launchSplitRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__
   dim3 dimCostGrid(num_rollouts, 1, 1);
   unsigned cost_shared_size = calcRolloutCostKernelSharedMemSize(costs, sampling, dimCostBlock);
   rolloutCostKernel<COST_T, SAMPLING_T, COALESCE><<<dimCostGrid, dimCostBlock, cost_shared_size, stream>>>(
-      costs->cost_d_, sampling->sampling_d_, dt, num_timesteps, num_rollouts, lambda, alpha, y_d, trajectory_costs);
+      costs->cost_d_, sampling->sampling_d_, dt, num_timesteps, num_rollouts, lambda, alpha, y_d,
+      trajectory_costs, rollout_crash_status_d);
   HANDLE_ERROR(cudaGetLastError());
   if (synchronize)
   {
@@ -1307,7 +1569,8 @@ template <class DYN_T, class COST_T, typename SAMPLING_T>
 void launchRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__ costs, SAMPLING_T* __restrict__ sampling,
                          float dt, const int num_timesteps, const int num_rollouts, float lambda, float alpha,
                          float* __restrict__ init_x_d, float* __restrict__ trajectory_costs, dim3 dimBlock,
-                         cudaStream_t stream, bool synchronize)
+                         cudaStream_t stream, bool synchronize,
+                         int* __restrict__ rollout_crash_status_d)
 {
   if (num_rollouts % dimBlock.x != 0)
   {
@@ -1323,7 +1586,7 @@ void launchRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__ cost
                                     cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size));
   rolloutKernel<DYN_T, COST_T, SAMPLING_T><<<dimGrid, dimBlock, shared_mem_size, stream>>>(
       dynamics->model_d_, sampling->sampling_d_, costs->cost_d_, dt, num_timesteps, num_rollouts, init_x_d, lambda,
-      alpha, trajectory_costs);
+      alpha, trajectory_costs, rollout_crash_status_d);
   HANDLE_ERROR(cudaGetLastError());
   if (synchronize)
   {
@@ -1412,6 +1675,43 @@ void launchNormExpKernel(int num_rollouts, int blocksize_x, float* trajectory_co
   dim3 dimBlock(blocksize_x, 1, 1);
   dim3 dimGrid((num_rollouts - 1) / blocksize_x + 1, 1, 1);
   normExpKernel<<<dimGrid, dimBlock, 0, stream>>>(num_rollouts, trajectory_costs_d, lambda_inv, baseline);
+  HANDLE_ERROR(cudaGetLastError());
+  if (synchronize)
+  {
+    HANDLE_ERROR(cudaStreamSynchronize(stream));
+  }
+}
+
+void launchMinMaxWeightKernel(int num_rollouts, int blocksize_x, float* trajectory_costs_d,
+                              const int* rollout_crash_status_d, float lambda_inv,
+                              float normalization_percentile, float range_epsilon,
+                              CostWeightStats* stats_d, cudaStream_t stream, bool synchronize)
+{
+  int threads = 1;
+  int requested_threads = blocksize_x;
+  if (num_rollouts >= 256)
+  {
+    // The legacy transform default is only 64 threads because it launches many blocks. This
+    // fused global reduction uses one block, so expose enough warps to hide the array-scan latency.
+    requested_threads = requested_threads < 256 ? 256 : requested_threads;
+  }
+  if (requested_threads < 32)
+  {
+    requested_threads = 32;
+  }
+  else if (requested_threads > 1024)
+  {
+    requested_threads = 1024;
+  }
+  while (threads * 2 <= requested_threads)
+  {
+    threads *= 2;
+  }
+  const size_t shared_bytes = static_cast<size_t>(threads) *
+                              (4U * sizeof(float) + sizeof(int));
+  minMaxWeightKernel<<<1, threads, shared_bytes, stream>>>(
+      num_rollouts, trajectory_costs_d, rollout_crash_status_d, lambda_inv,
+      normalization_percentile, range_epsilon, stats_d);
   HANDLE_ERROR(cudaGetLastError());
   if (synchronize)
   {

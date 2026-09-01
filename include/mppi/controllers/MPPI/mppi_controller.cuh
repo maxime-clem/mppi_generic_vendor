@@ -11,6 +11,8 @@
 #include <mppi/controllers/controller.cuh>
 #include <mppi/sampling_distributions/gaussian/gaussian.cuh>
 
+#include <vector>
+
 template <class DYN_T, class COST_T, class FB_T, int MAX_TIMESTEPS, int NUM_ROLLOUTS,
           class SAMPLING_T = ::mppi::sampling_distributions::GaussianDistribution<typename DYN_T::DYN_PARAMS_T>,
           class PARAMS_T = ControllerParams<DYN_T::STATE_DIM, DYN_T::CONTROL_DIM, MAX_TIMESTEPS>>
@@ -66,7 +68,71 @@ public:
 
   void chooseAppropriateKernel() override;
 
+  /** Configure robust weighting, the ESS target, and bounded temperature feedback. */
+  void configureEssLambdaAdaptation(float target_ess_ratio, float adaptation_gain,
+                                    float lambda_min, float lambda_max,
+                                    float unsafe_rollout_fraction_threshold = 0.95F,
+                                    float cost_normalization_percentile = 0.95F);
+
+  const std::vector<float>& getIterationEffectiveSampleSizes() const
+  {
+    return iteration_effective_sample_sizes_;
+  }
+
+  float getLastWeightLambda() const
+  {
+    return last_iteration_weight_lambda_;
+  }
+
+  float getNextWeightLambda() const
+  {
+    return last_weight_lambda_;
+  }
+
+  float getLastMinRolloutCost() const
+  {
+    return weight_stats_h_->min_cost;
+  }
+
+  float getLastMaxRolloutCost() const
+  {
+    return weight_stats_h_->max_cost;
+  }
+
+  float getLastNormalizationUpperCost() const
+  {
+    return weight_stats_h_->normalization_upper_cost;
+  }
+
+  float getLastUnsafeRolloutFraction() const
+  {
+    return weight_stats_h_->unsafe_rollout_fraction;
+  }
+
+  float getLastUnnormalizedWeightSum() const
+  {
+    return weight_stats_h_->normalizer;
+  }
+
+  /** Explicitly download the final normalized importance weights for debug consumers. */
+  void downloadImportanceWeightsToHost();
+
 protected:
+  /**
+   * Called after a rollout batch only when requiresRawRolloutCostsForIteration() is true. Derived
+   * controllers can capture per-iteration diagnostics before raw costs are replaced by weights.
+   */
+  virtual void optimizationIterationComplete(int iteration)
+  {
+    (void)iteration;
+  }
+
+  /** Whether optimizationIterationComplete needs the raw rollout costs in trajectory_costs_. */
+  virtual bool requiresRawRolloutCostsForIteration() const
+  {
+    return false;
+  }
+
   void computeStateTrajectory(const Eigen::Ref<const state_array>& x0);
 
   void smoothControlTrajectory();
@@ -75,6 +141,24 @@ private:
   // ======== MUST BE OVERWRITTEN =========
   void allocateCUDAMemory();
   // ======== END MUST BE OVERWRITTEN =====
+
+  mppi::kernels::CostWeightStats* weight_stats_d_ = nullptr;
+  /** One collision/safety flag per rollout, produced by the rollout cost kernel. */
+  int* rollout_crash_status_d_ = nullptr;
+  /** Pinned because one tiny asynchronous D2H update is queued per optimization iteration. */
+  mppi::kernels::CostWeightStats* weight_stats_h_ = nullptr;
+  std::vector<float> iteration_effective_sample_sizes_;
+  /** Persisted adaptive state to be used by the next control step. */
+  float last_weight_lambda_ = 1.0F;
+  /** Lambda that produced the final iteration's stored weights and statistics. */
+  float last_iteration_weight_lambda_ = 1.0F;
+  float target_ess_ratio_ = 0.2F;
+  float lambda_adaptation_gain_ = 0.1F;
+  float lambda_min_ = 0.01F;
+  float lambda_max_ = 2.0F;
+  float unsafe_rollout_fraction_threshold_ = 0.95F;
+  float cost_normalization_percentile_ = 0.95F;
+  bool lambda_adaptation_enabled_ = false;
 };
 
 #if __CUDACC__

@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <limits>
 #include <numeric>
 #include <random>
 
@@ -147,6 +149,176 @@ TEST_F(NormExpKernel, computeExpNorm_Test)
   launchNormExp_KernelTest<num_rollouts>(cost_vec, gamma, baseline, normalized_compute);
 
   array_assert_float_eq<num_rollouts>(normalized_compute, normalized_known);
+}
+
+TEST_F(NormExpKernel, MinMaxWeightKernelComputesWeightsAndEss)
+{
+  constexpr int num_rollouts = 4;
+  std::array<float, num_rollouts> costs{10.0F, 20.0F, 30.0F, 40.0F};
+  std::array<float, num_rollouts> weights{};
+  float* costs_d = nullptr;
+  mppi::kernels::CostWeightStats* stats_d = nullptr;
+  mppi::kernels::CostWeightStats stats;
+  HANDLE_ERROR(cudaMalloc((void**)&costs_d, sizeof(float) * num_rollouts));
+  HANDLE_ERROR(cudaMalloc((void**)&stats_d, sizeof(stats)));
+  HANDLE_ERROR(cudaMemcpy(costs_d, costs.data(), sizeof(float) * num_rollouts, cudaMemcpyHostToDevice));
+
+  mppi::kernels::launchMinMaxWeightKernel(
+      num_rollouts, 64, costs_d, nullptr, 1.0F, 0.95F, 1.0E-6F, stats_d, nullptr, true);
+  HANDLE_ERROR(cudaMemcpy(weights.data(), costs_d, sizeof(float) * num_rollouts, cudaMemcpyDeviceToHost));
+  HANDLE_ERROR(cudaMemcpy(&stats, stats_d, sizeof(stats), cudaMemcpyDeviceToHost));
+
+  float expected_sum = 0.0F;
+  float expected_squared_sum = 0.0F;
+  for (int i = 0; i < num_rollouts; ++i)
+  {
+    const float expected_weight = expf(-static_cast<float>(i) / 3.0F);
+    expected_sum += expected_weight;
+    expected_squared_sum += expected_weight * expected_weight;
+  }
+  for (int i = 0; i < num_rollouts; ++i)
+  {
+    const float expected_weight = expf(-static_cast<float>(i) / 3.0F) / expected_sum;
+    EXPECT_NEAR(weights[i], expected_weight, 1.0E-6F);
+  }
+  EXPECT_FLOAT_EQ(stats.min_cost, 10.0F);
+  EXPECT_FLOAT_EQ(stats.max_cost, 40.0F);
+  EXPECT_NEAR(stats.normalization_upper_cost, 40.0F, 1.0E-4F);
+  EXPECT_FLOAT_EQ(stats.rollout_min_cost, 10.0F);
+  EXPECT_NEAR(stats.normalizer, expected_sum, 1.0E-6F);
+  EXPECT_NEAR(stats.effective_sample_size, expected_sum * expected_sum / expected_squared_sum, 1.0E-5F);
+  EXPECT_FLOAT_EQ(stats.raw_cost_sum, 100.0F);
+  EXPECT_FLOAT_EQ(stats.raw_cost_squared_sum, 3000.0F);
+
+  HANDLE_ERROR(cudaFree(stats_d));
+  HANDLE_ERROR(cudaFree(costs_d));
+}
+
+TEST_F(NormExpKernel, MinMaxWeightKernelHandlesDegenerateCostRange)
+{
+  constexpr int num_rollouts = 32;
+  std::array<float, num_rollouts> costs{};
+  for (int i = 0; i < num_rollouts; ++i)
+  {
+    costs[i] = (i % 2 == 0) ? 0.0F : 5.0E-7F;
+  }
+  float* costs_d = nullptr;
+  mppi::kernels::CostWeightStats* stats_d = nullptr;
+  mppi::kernels::CostWeightStats stats;
+  HANDLE_ERROR(cudaMalloc((void**)&costs_d, sizeof(float) * num_rollouts));
+  HANDLE_ERROR(cudaMalloc((void**)&stats_d, sizeof(stats)));
+  HANDLE_ERROR(cudaMemcpy(costs_d, costs.data(), sizeof(float) * num_rollouts, cudaMemcpyHostToDevice));
+
+  mppi::kernels::launchMinMaxWeightKernel(
+      num_rollouts, 64, costs_d, nullptr, 10.0F, 0.95F, 1.0E-6F, stats_d, nullptr, true);
+  HANDLE_ERROR(cudaMemcpy(costs.data(), costs_d, sizeof(float) * num_rollouts, cudaMemcpyDeviceToHost));
+  HANDLE_ERROR(cudaMemcpy(&stats, stats_d, sizeof(stats), cudaMemcpyDeviceToHost));
+
+  for (const float weight : costs)
+  {
+    EXPECT_FLOAT_EQ(weight, 1.0F / static_cast<float>(num_rollouts));
+  }
+  EXPECT_FLOAT_EQ(stats.normalizer, static_cast<float>(num_rollouts));
+  EXPECT_FLOAT_EQ(stats.effective_sample_size, static_cast<float>(num_rollouts));
+  EXPECT_FLOAT_EQ(stats.min_cost, 0.0F);
+  EXPECT_FLOAT_EQ(stats.max_cost, 5.0E-7F);
+  EXPECT_FLOAT_EQ(stats.rollout_min_cost, 0.0F);
+  EXPECT_NEAR(stats.raw_cost_sum, 8.0E-6F, 1.0E-12F);
+  EXPECT_NEAR(stats.raw_cost_squared_sum, 4.0E-12F, 1.0E-18F);
+
+  HANDLE_ERROR(cudaFree(stats_d));
+  HANDLE_ERROR(cudaFree(costs_d));
+}
+
+TEST_F(NormExpKernel, MinMaxWeightKernelDoesNotRewardNonFiniteCosts)
+{
+  constexpr int num_rollouts = 4;
+  std::array<float, num_rollouts> costs{
+      7.0F, 7.0F, std::numeric_limits<float>::infinity(),
+      std::numeric_limits<float>::quiet_NaN()};
+  float* costs_d = nullptr;
+  mppi::kernels::CostWeightStats* stats_d = nullptr;
+  mppi::kernels::CostWeightStats stats;
+  HANDLE_ERROR(cudaMalloc((void**)&costs_d, sizeof(float) * num_rollouts));
+  HANDLE_ERROR(cudaMalloc((void**)&stats_d, sizeof(stats)));
+  HANDLE_ERROR(cudaMemcpy(costs_d, costs.data(), sizeof(float) * num_rollouts, cudaMemcpyHostToDevice));
+
+  mppi::kernels::launchMinMaxWeightKernel(
+      num_rollouts, 64, costs_d, nullptr, 1.0F, 0.95F, 1.0E-6F, stats_d, nullptr, true);
+  HANDLE_ERROR(cudaMemcpy(costs.data(), costs_d, sizeof(float) * num_rollouts, cudaMemcpyDeviceToHost));
+  HANDLE_ERROR(cudaMemcpy(&stats, stats_d, sizeof(stats), cudaMemcpyDeviceToHost));
+
+  EXPECT_GT(costs[0], costs[2]);
+  EXPECT_GT(costs[1], costs[3]);
+  EXPECT_NEAR(std::accumulate(costs.begin(), costs.end(), 0.0F), 1.0F, 1.0E-6F);
+  EXPECT_TRUE(std::isfinite(stats.effective_sample_size));
+  EXPECT_FLOAT_EQ(stats.raw_cost_sum, 14.0F);
+  EXPECT_FLOAT_EQ(stats.raw_cost_squared_sum, 98.0F);
+  EXPECT_FLOAT_EQ(stats.rollout_min_cost, 7.0F);
+
+  HANDLE_ERROR(cudaFree(stats_d));
+  HANDLE_ERROR(cudaFree(costs_d));
+}
+
+TEST_F(NormExpKernel, RobustPercentilePreventsSingleOutlierFromDefiningScale)
+{
+  constexpr int num_rollouts = 101;
+  std::array<float, num_rollouts> costs{};
+  for (int i = 0; i < num_rollouts - 1; ++i)
+  {
+    costs[i] = static_cast<float>(i);
+  }
+  costs.back() = 1.0E6F;
+
+  float* costs_d = nullptr;
+  mppi::kernels::CostWeightStats* stats_d = nullptr;
+  mppi::kernels::CostWeightStats stats;
+  HANDLE_ERROR(cudaMalloc((void**)&costs_d, sizeof(float) * num_rollouts));
+  HANDLE_ERROR(cudaMalloc((void**)&stats_d, sizeof(stats)));
+  HANDLE_ERROR(cudaMemcpy(costs_d, costs.data(), sizeof(float) * num_rollouts, cudaMemcpyHostToDevice));
+
+  mppi::kernels::launchMinMaxWeightKernel(
+      num_rollouts, 256, costs_d, nullptr, 1.0F, 0.95F, 1.0E-6F, stats_d, nullptr, true);
+  HANDLE_ERROR(cudaMemcpy(&stats, stats_d, sizeof(stats), cudaMemcpyDeviceToHost));
+
+  EXPECT_FLOAT_EQ(stats.min_cost, 0.0F);
+  EXPECT_FLOAT_EQ(stats.max_cost, 1.0E6F);
+  EXPECT_NEAR(stats.normalization_upper_cost, 95.0F, 0.1F);
+
+  HANDLE_ERROR(cudaFree(stats_d));
+  HANDLE_ERROR(cudaFree(costs_d));
+}
+
+TEST_F(NormExpKernel, ReportsUnsafeRolloutFraction)
+{
+  constexpr int num_rollouts = 10;
+  std::array<float, num_rollouts> costs{};
+  std::array<int, num_rollouts> crash_status{0, 1, 0, 0, 1, 0, 0, 0, 1, 0};
+  for (int i = 0; i < num_rollouts; ++i)
+  {
+    costs[i] = static_cast<float>(i);
+  }
+
+  float* costs_d = nullptr;
+  int* crash_status_d = nullptr;
+  mppi::kernels::CostWeightStats* stats_d = nullptr;
+  mppi::kernels::CostWeightStats stats;
+  HANDLE_ERROR(cudaMalloc((void**)&costs_d, sizeof(float) * num_rollouts));
+  HANDLE_ERROR(cudaMalloc((void**)&crash_status_d, sizeof(int) * num_rollouts));
+  HANDLE_ERROR(cudaMalloc((void**)&stats_d, sizeof(stats)));
+  HANDLE_ERROR(cudaMemcpy(costs_d, costs.data(), sizeof(float) * num_rollouts, cudaMemcpyHostToDevice));
+  HANDLE_ERROR(cudaMemcpy(
+      crash_status_d, crash_status.data(), sizeof(int) * num_rollouts, cudaMemcpyHostToDevice));
+
+  mppi::kernels::launchMinMaxWeightKernel(
+      num_rollouts, 64, costs_d, crash_status_d, 1.0F, 0.95F, 1.0E-6F, stats_d, nullptr, true);
+  HANDLE_ERROR(cudaMemcpy(&stats, stats_d, sizeof(stats), cudaMemcpyDeviceToHost));
+
+  EXPECT_NEAR(stats.unsafe_rollout_fraction, 0.3F, 1.0E-6F);
+
+  HANDLE_ERROR(cudaFree(stats_d));
+  HANDLE_ERROR(cudaFree(crash_status_d));
+  HANDLE_ERROR(cudaFree(costs_d));
 }
 
 TEST_F(NormExpKernel, comparisonTestAutorallyMPPI_Generic)

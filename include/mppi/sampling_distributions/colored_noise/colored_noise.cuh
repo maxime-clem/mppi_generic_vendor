@@ -102,6 +102,9 @@ public:
 
   __host__ void freeCudaMem();
 
+  /** Upload frequency-domain scaling only when sampler parameters or dimensions change. */
+  __host__ void paramsToDevice(bool synchronize = true);
+
   __host__ void generateSamples(const int& optimization_stride, const int& iteration_num, curandGenerator_t& gen,
                                 bool synchronize = true);
 
@@ -116,7 +119,11 @@ public:
   }
 
 protected:
+  __host__ void updateFrequencyScaling();
+
   cufftHandle plan_;
+  Eigen::MatrixXf frequency_coeffs_h_;
+  std::vector<float> frequency_sigma_h_;
   float* frequency_sigma_d_ = nullptr;
   float* noise_in_time_d_ = nullptr;
   cufftComplex* samples_in_freq_complex_d_ = nullptr;

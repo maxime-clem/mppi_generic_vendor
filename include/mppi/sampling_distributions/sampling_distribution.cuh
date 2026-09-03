@@ -415,6 +415,22 @@ public:
                                                            const int& distribution_i, bool synchronize = false) = 0;
 
   /**
+   * @brief Update the device-side distribution without refreshing any host-side cache.
+   *
+   * Controllers that perform several optimization iterations should use this method so the
+   * updated distribution remains on the GPU between iterations. The default implementation
+   * preserves compatibility with custom distributions, while distributions with a host cache
+   * should override it to avoid an implicit device-to-host transfer.
+   */
+  __host__ virtual void updateDistributionParamsFromDeviceOnly(const float* trajectory_weights_d,
+                                                               float normalizer,
+                                                               const int& distribution_i,
+                                                               bool synchronize = false)
+  {
+    updateDistributionParamsFromDevice(trajectory_weights_d, normalizer, distribution_i, synchronize);
+  }
+
+  /**
    * @brief Write to a specific control sample located at [distribution_index][sample_index][t] from the
    * control array
    *

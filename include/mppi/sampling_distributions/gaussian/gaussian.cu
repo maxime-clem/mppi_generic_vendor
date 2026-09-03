@@ -7,6 +7,8 @@
 #include <mppi/utils/cuda_math_utils.cuh>
 #include <mppi/utils/math_utils.h>
 
+#include <algorithm>
+
 namespace mppi
 {
 namespace sampling_distributions
@@ -434,6 +436,27 @@ GAUSSIAN_TEMPLATE
 __host__ void GAUSSIAN_CLASS::updateDistributionParamsFromDevice(const float* trajectory_weights_d, float normalizer,
                                                                  const int& distribution_i, bool synchronize)
 {
+  updateDistributionParamsFromDeviceOnly(trajectory_weights_d, normalizer, distribution_i, false);
+  if (distribution_i >= this->getNumDistributions())
+  {
+    return;
+  }
+  float* control_mean_i_d = &(this->control_means_d_[distribution_i * this->getNumTimesteps() * CONTROL_DIM]);
+  HANDLE_ERROR(cudaMemcpyAsync(&means_[distribution_i * this->getNumTimesteps() * CONTROL_DIM], control_mean_i_d,
+                               sizeof(float) * this->getNumTimesteps() * CONTROL_DIM, cudaMemcpyDeviceToHost,
+                               this->stream_));
+  if (synchronize)
+  {
+    HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
+  }
+}
+
+GAUSSIAN_TEMPLATE
+__host__ void GAUSSIAN_CLASS::updateDistributionParamsFromDeviceOnly(const float* trajectory_weights_d,
+                                                                     float normalizer,
+                                                                     const int& distribution_i,
+                                                                     bool synchronize)
+{
   if (distribution_i >= this->getNumDistributions())
   {
     this->logger_->error(
@@ -447,13 +470,6 @@ __host__ void GAUSSIAN_CLASS::updateDistributionParamsFromDevice(const float* tr
   mppi::kernels::launchWeightedReductionKernel<CONTROL_DIM>(trajectory_weights_d, control_samples_i_d, control_mean_i_d,
                                                             normalizer, this->getNumTimesteps(), this->getNumRollouts(),
                                                             this->params_.sum_strides, this->stream_, synchronize);
-  HANDLE_ERROR(cudaMemcpyAsync(&means_[distribution_i * this->getNumTimesteps() * CONTROL_DIM], control_mean_i_d,
-                               sizeof(float) * this->getNumTimesteps() * CONTROL_DIM, cudaMemcpyDeviceToHost,
-                               this->stream_));
-  if (synchronize)
-  {
-    HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
-  }
 }
 
 GAUSSIAN_TEMPLATE
@@ -474,6 +490,8 @@ __host__ void GAUSSIAN_CLASS::setHostOptimalControlSequence(float* optimal_contr
   if (synchronize)
   {
     HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
+    std::copy_n(optimal_control_trajectory, this->getNumTimesteps() * CONTROL_DIM,
+                &means_[this->getNumTimesteps() * CONTROL_DIM * distribution_i]);
   }
 }
 

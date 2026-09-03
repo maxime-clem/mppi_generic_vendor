@@ -204,6 +204,27 @@ SMOOTH_MPPI_TEMPLATE
 __host__ void SMOOTH_MPPI_NOISE::updateDistributionParamsFromDevice(const float* trajectory_weights_d, float normalizer,
                                                                     const int& distribution_i, bool synchronize)
 {
+  updateDistributionParamsFromDeviceOnly(trajectory_weights_d, normalizer, distribution_i, false);
+  if (distribution_i >= this->getNumDistributions())
+  {
+    return;
+  }
+  const int mean_index = distribution_i * this->getNumTimesteps() * this->CONTROL_DIM;
+  HANDLE_ERROR(cudaMemcpyAsync(&this->means_[mean_index], &this->control_means_d_[mean_index],
+                               sizeof(float) * this->getNumTimesteps() * CONTROL_DIM, cudaMemcpyDeviceToHost,
+                               this->stream_));
+  if (synchronize)
+  {
+    HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
+  }
+}
+
+SMOOTH_MPPI_TEMPLATE
+__host__ void SMOOTH_MPPI_NOISE::updateDistributionParamsFromDeviceOnly(const float* trajectory_weights_d,
+                                                                        float normalizer,
+                                                                        const int& distribution_i,
+                                                                        bool synchronize)
+{
   if (distribution_i >= this->getNumDistributions())
   {
     std::cerr << "Updating distributional params for distribution " << distribution_i << " out of "
@@ -223,16 +244,10 @@ __host__ void SMOOTH_MPPI_NOISE::updateDistributionParamsFromDevice(const float*
   integrateNoise<<<grid, block, 0, this->stream_>>>(deriv_action_mean_i_d, &this->control_means_d_[mean_index],
                                                     &this->control_samples_d_[sample_index], 1, this->getNumTimesteps(),
                                                     this->CONTROL_DIM, this->params_.dt);
+  HANDLE_ERROR(cudaGetLastError());
   HANDLE_ERROR(cudaMemcpyAsync(&this->control_means_d_[mean_index], &this->control_samples_d_[sample_index],
                                sizeof(float) * this->getNumTimesteps() * this->CONTROL_DIM, cudaMemcpyDeviceToDevice,
                                this->stream_));
-  HANDLE_ERROR(cudaMemcpyAsync(&this->means_[mean_index], &this->control_means_d_[mean_index],
-                               sizeof(float) * this->getNumTimesteps() * CONTROL_DIM, cudaMemcpyDeviceToHost,
-                               this->stream_));
-  // HANDLE_ERROR(cudaMemcpyAsync(&means_[distribution_i * this->getNumTimesteps() * CONTROL_DIM],
-  // deriv_action_mean_i_d,
-  //                              sizeof(float) * this->getNumTimesteps() * CONTROL_DIM, cudaMemcpyDeviceToHost,
-  //                              this->stream_));
   if (synchronize)
   {
     HANDLE_ERROR(cudaStreamSynchronize(this->stream_));

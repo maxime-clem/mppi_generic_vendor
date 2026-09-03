@@ -67,6 +67,10 @@ public:
   __host__ void updateDistributionParamsFromDevice(const float* trajectory_weights_d, float normalizer,
                                                    const int& distribution_i, bool synchronize = false) override;
 
+  __host__ void updateDistributionParamsFromDeviceOnly(const float* trajectory_weights_d, float normalizer,
+                                                       const int& distribution_i,
+                                                       bool synchronize = false) override;
+
 protected:
   float* deriv_action_mean_d_ = nullptr;
   float* deriv_action_noise_d_ = nullptr;

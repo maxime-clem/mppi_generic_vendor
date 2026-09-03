@@ -283,25 +283,31 @@ __host__ void COLORED_NOISE::allocateCUDAMemoryHelper()
 }
 
 COLORED_TEMPLATE
-__host__ void COLORED_NOISE::generateSamples(const int& optimization_stride, const int& iteration_num,
-                                             curandGenerator_t& gen, bool synchronize)
+__host__ void COLORED_NOISE::paramsToDevice(bool synchronize)
 {
-  const int BLOCKSIZE_X = this->params_.rewrite_controls_block_dim.x;
-  const int BLOCKSIZE_Y = this->params_.rewrite_controls_block_dim.y;
-  const int BLOCKSIZE_Z = this->params_.rewrite_controls_block_dim.z;
-  const int num_trajectories = this->getNumRollouts() * this->getNumDistributions();
+  PARENT_CLASS::paramsToDevice(false);
+  if (this->GPUMemStatus_)
+  {
+    updateFrequencyScaling();
+    if (synchronize)
+    {
+      HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
+    }
+  }
+}
 
-  std::vector<float> sample_freq;
+COLORED_TEMPLATE
+__host__ void COLORED_NOISE::updateFrequencyScaling()
+{
   const int sample_num_timesteps = 2 * this->getNumTimesteps();
+  std::vector<float> sample_freq;
   fftfreq(sample_num_timesteps, sample_freq);
   const float cutoff_freq = fmaxf(this->params_.fmin, 1.0f / sample_num_timesteps);
   const int freq_size = sample_freq.size();
+  const int local_control_dim = this->CONTROL_DIM;
+  frequency_coeffs_h_.resize(freq_size, local_control_dim);
 
   int smaller_index = 0;
-  const int local_control_dim = this->CONTROL_DIM;  // Needed for methods which use pass by reference
-  Eigen::MatrixXf sample_freqs(freq_size, local_control_dim);
-
-  // Adjust the weighting of each frequency by the exponents
   for (int i = 0; i < freq_size; i++)
   {
     if (sample_freq[i] < cutoff_freq)
@@ -315,36 +321,53 @@ __host__ void COLORED_NOISE::generateSamples(const int& optimization_stride, con
         sample_freq[j] = sample_freq[smaller_index];
         for (int k = 0; k < this->CONTROL_DIM; k++)
         {
-          sample_freqs(j, k) = powf(sample_freq[smaller_index], -this->params_.exponents[k] / 2.0f);
+          frequency_coeffs_h_(j, k) =
+              powf(sample_freq[smaller_index], -this->params_.exponents[k] / 2.0f);
         }
       }
     }
     for (int j = 0; j < this->CONTROL_DIM; j++)
     {
-      sample_freqs(i, j) = powf(sample_freq[i], -this->params_.exponents[j] / 2.0f);
+      frequency_coeffs_h_(i, j) = powf(sample_freq[i], -this->params_.exponents[j] / 2.0f);
     }
   }
 
-  // Calculate variance
-  float sigma[this->CONTROL_DIM] = { 0 };
+  frequency_sigma_h_.assign(this->CONTROL_DIM, 0.0F);
   for (int i = 0; i < this->CONTROL_DIM; i++)
   {
     for (int j = 1; j < freq_size - 1; j++)
     {
-      sigma[i] += SQ(sample_freqs(j, i));
+      frequency_sigma_h_[i] += SQ(frequency_coeffs_h_(j, i));
     }
-    sigma[i] += SQ(sample_freqs(freq_size - 1, i) * ((1.0f + (sample_num_timesteps % 2)) / 2.0f));
-    sigma[i] = 2.0f * sqrtf(sigma[i]) / sample_num_timesteps;
+    frequency_sigma_h_[i] +=
+        SQ(frequency_coeffs_h_(freq_size - 1, i) * ((1.0f + (sample_num_timesteps % 2)) / 2.0f));
+    frequency_sigma_h_[i] = 2.0f * sqrtf(frequency_sigma_h_[i]) / sample_num_timesteps;
   }
+
+  HANDLE_ERROR(cudaMemcpyAsync(freq_coeffs_d_, frequency_coeffs_h_.data(),
+                               sizeof(float) * freq_size * this->CONTROL_DIM, cudaMemcpyHostToDevice,
+                               this->stream_));
+  HANDLE_ERROR(cudaMemcpyAsync(frequency_sigma_d_, frequency_sigma_h_.data(),
+                               sizeof(float) * this->CONTROL_DIM, cudaMemcpyHostToDevice, this->stream_));
+}
+
+COLORED_TEMPLATE
+__host__ void COLORED_NOISE::generateSamples(const int& optimization_stride, const int& iteration_num,
+                                             curandGenerator_t& gen, bool synchronize)
+{
+  const int BLOCKSIZE_X = this->params_.rewrite_controls_block_dim.x;
+  const int BLOCKSIZE_Y = this->params_.rewrite_controls_block_dim.y;
+  const int BLOCKSIZE_Z = this->params_.rewrite_controls_block_dim.z;
+  const int num_trajectories = this->getNumRollouts() * this->getNumDistributions();
+
+  const int sample_num_timesteps = 2 * this->getNumTimesteps();
+  const int freq_size = sample_num_timesteps / 2 + 1;
+  const int local_control_dim = this->CONTROL_DIM;  // Needed for methods which use pass by reference
 
   // Sample the noise in frequency domain and reutrn to time domain
   const int batch = num_trajectories * this->CONTROL_DIM;
   // Need 2 * (sample_num_timesteps / 2 + 1) * batch of randomly sampled values
   HANDLE_CURAND_ERROR(curandGenerateNormal(gen, (float*)samples_in_freq_complex_d_, 2 * batch * freq_size, 0.0, 1.0));
-  HANDLE_ERROR(cudaMemcpyAsync(freq_coeffs_d_, sample_freqs.data(), sizeof(float) * freq_size * this->CONTROL_DIM,
-                               cudaMemcpyHostToDevice, this->stream_));
-  HANDLE_ERROR(cudaMemcpyAsync(frequency_sigma_d_, sigma, sizeof(float) * this->CONTROL_DIM, cudaMemcpyHostToDevice,
-                               this->stream_));
   const int num_trajectories_grid_x = mppi::math::int_ceil(num_trajectories, BLOCKSIZE_X);
   const int variance_grid_y = (freq_size - 1) / BLOCKSIZE_Y + 1;
   const int control_grid_z = mppi::math::int_ceil(local_control_dim, BLOCKSIZE_Z);

@@ -91,27 +91,27 @@ public:
 
   float getLastMinRolloutCost() const
   {
-    return weight_stats_h_->min_cost;
+    return lastWeightStats().min_cost;
   }
 
   float getLastMaxRolloutCost() const
   {
-    return weight_stats_h_->max_cost;
+    return lastWeightStats().max_cost;
   }
 
   float getLastNormalizationUpperCost() const
   {
-    return weight_stats_h_->normalization_upper_cost;
+    return lastWeightStats().normalization_upper_cost;
   }
 
   float getLastUnsafeRolloutFraction() const
   {
-    return weight_stats_h_->unsafe_rollout_fraction;
+    return lastWeightStats().unsafe_rollout_fraction;
   }
 
   float getLastUnnormalizedWeightSum() const
   {
-    return weight_stats_h_->normalizer;
+    return lastWeightStats().normalizer;
   }
 
   /** Explicitly download the final normalized importance weights for debug consumers. */
@@ -133,6 +133,12 @@ protected:
     return false;
   }
 
+  /** Device-reduced control before the generic host smoothing/constraint pass. */
+  const control_trajectory& getDeviceOptimalControlSequence() const
+  {
+    return device_optimal_control_;
+  }
+
   void computeStateTrajectory(const Eigen::Ref<const state_array>& x0);
 
   void smoothControlTrajectory();
@@ -142,11 +148,22 @@ private:
   void allocateCUDAMemory();
   // ======== END MUST BE OVERWRITTEN =====
 
+  void ensureWeightStatsCapacity(int required_capacity);
+
+  const mppi::kernels::CostWeightStats& lastWeightStats() const
+  {
+    return weight_stats_h_[last_weight_stats_index_];
+  }
+
   mppi::kernels::CostWeightStats* weight_stats_d_ = nullptr;
   /** One collision/safety flag per rollout, produced by the rollout cost kernel. */
   int* rollout_crash_status_d_ = nullptr;
-  /** Pinned because one tiny asynchronous D2H update is queued per optimization iteration. */
+  /** Pinned host mirror downloaded once after all optimization iterations complete. */
   mppi::kernels::CostWeightStats* weight_stats_h_ = nullptr;
+  int weight_stats_capacity_ = 0;
+  int last_weight_stats_index_ = 0;
+  /** Host snapshot of the final device mean before generic host-side post-processing. */
+  control_trajectory device_optimal_control_ = control_trajectory::Zero();
   std::vector<float> iteration_effective_sample_sizes_;
   /** Persisted adaptive state to be used by the next control step. */
   float last_weight_lambda_ = 1.0F;

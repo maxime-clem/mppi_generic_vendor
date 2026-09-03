@@ -197,6 +197,9 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
 {
   this->free_energy_statistics_.real_sys.previousBaseline = this->getBaselineCost();
 
+  const int num_iterations = std::max(0, this->getNumIters());
+  ensureWeightStatsCapacity(std::max(1, num_iterations));
+
   // Send the initial condition to the device
   HANDLE_ERROR(cudaMemcpyAsync(this->initial_state_d_, state.data(), DYN_T::STATE_DIM * sizeof(float),
                                cudaMemcpyHostToDevice, this->stream_));
@@ -207,7 +210,7 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
                             : 0.0F;
   iteration_effective_sample_sizes_.clear();
   iteration_effective_sample_sizes_.reserve(
-      static_cast<std::size_t>(this->getNumIters()));
+      static_cast<std::size_t>(num_iterations));
   // Apply the temperature prepared by the previous control step before entering the optimization
   // loop; it then remains fixed for every iteration in this step.
   if (lambda_adaptation_enabled_)
@@ -221,12 +224,15 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
   last_iteration_weight_lambda_ = last_weight_lambda_;
   this->setLambda(last_weight_lambda_);
 
-  for (int opt_iter = 0; opt_iter < this->getNumIters(); opt_iter++)
+  // The host-provided warm start is needed only by iteration zero. Every subsequent iteration
+  // consumes the control mean produced by the preceding device reduction.
+  if (num_iterations > 0)
   {
-    last_iteration_weight_lambda_ = last_weight_lambda_;
-    // Send the nominal control to the device
     this->copyNominalControlToDevice(false);
+  }
 
+  for (int opt_iter = 0; opt_iter < num_iterations; opt_iter++)
+  {
     // Generate noise data
     this->sampler_->generateSamples(optimization_stride, opt_iter, this->gen_, false);
 
@@ -257,28 +263,44 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
     }
 
     // One device kernel computes robust-normalized exponential weights, the weight normalizer,
-    // ESS, and safety statistics. Only this scalar record crosses back to the host.
+    // ESS, and safety statistics. The per-iteration records remain on-device until the loop ends.
     mppi::kernels::launchMinMaxWeightKernel(
         NUM_ROLLOUTS, this->getNormExpThreads(), this->trajectory_costs_d_,
         rollout_crash_status_d_, 1.0F / last_iteration_weight_lambda_,
-        cost_normalization_percentile_, 1.0E-6F, weight_stats_d_, this->stream_, false);
+        cost_normalization_percentile_, 1.0E-6F, weight_stats_d_ + opt_iter, this->stream_, false);
     // The fused kernel normalizes weights in-place; sampler reduction therefore uses unity.
     this->setNormalizer(1.0F);
 
-    this->sampler_->updateDistributionParamsFromDevice(this->trajectory_costs_d_, 1.0F, 0, false);
-    HANDLE_ERROR(cudaMemcpyAsync(weight_stats_h_, weight_stats_d_, sizeof(*weight_stats_h_),
+    this->sampler_->updateDistributionParamsFromDeviceOnly(this->trajectory_costs_d_, 1.0F, 0, false);
+  }
+
+  if (num_iterations > 0)
+  {
+    // Queue both final results before the sampler performs the control step's only required host
+    // synchronization. The optimization loop above contains no host transfers or barriers unless
+    // explicit per-iteration raw-rollout diagnostics are enabled.
+    HANDLE_ERROR(cudaMemcpyAsync(weight_stats_h_, weight_stats_d_,
+                                 static_cast<std::size_t>(num_iterations) * sizeof(*weight_stats_h_),
                                  cudaMemcpyDeviceToHost, this->stream_));
-
-    // Transfer the new control to the host. Its existing stream synchronization also completes
-    // the preceding pinned statistics transfer, avoiding a second per-iteration barrier.
     this->sampler_->setHostOptimalControlSequence(this->control_.data(), 0, true);
+    device_optimal_control_ = this->control_;
+    last_weight_stats_index_ = num_iterations - 1;
+  }
+  else
+  {
+    device_optimal_control_ = this->control_;
+  }
 
-    // Keep the controller baseline absolute and current, but protect against all-failed rollouts
-    if (weight_stats_h_->rollout_min_cost < FLT_MAX)
+  for (int opt_iter = 0; opt_iter < num_iterations; ++opt_iter)
+  {
+    const auto& weight_stats = weight_stats_h_[opt_iter];
+
+    // Keep the controller baseline absolute and current, but protect against all-failed rollouts.
+    if (weight_stats.rollout_min_cost < FLT_MAX)
     {
-      this->setBaseline(weight_stats_h_->rollout_min_cost);
+      this->setBaseline(weight_stats.rollout_min_cost);
     }
-    iteration_effective_sample_sizes_.push_back(weight_stats_h_->effective_sample_size);
+    iteration_effective_sample_sizes_.push_back(weight_stats.effective_sample_size);
 
     if (this->getBaselineCost() > baseline_prev + 1.0F)
     {
@@ -286,13 +308,13 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
     }
     baseline_prev = this->getBaselineCost();
 
-    const float mean_weight = weight_stats_h_->normalizer / rollout_count;
+    const float mean_weight = weight_stats.normalizer / rollout_count;
     this->free_energy_statistics_.real_sys.freeEnergyMean =
         -last_iteration_weight_lambda_ * std::log(std::max(mean_weight, 1.0E-12F));
 
-    const float mean_raw_cost = weight_stats_h_->raw_cost_sum / rollout_count;
+    const float mean_raw_cost = weight_stats.raw_cost_sum / rollout_count;
     const float mean_squared_raw_cost =
-        weight_stats_h_->raw_cost_squared_sum / rollout_count;
+        weight_stats.raw_cost_squared_sum / rollout_count;
     this->free_energy_statistics_.real_sys.freeEnergyVariance = std::max(
         0.0F, mean_squared_raw_cost - mean_raw_cost * mean_raw_cost);
     const float variance_scale =
@@ -305,10 +327,10 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
     // Adapt only from the converged iteration, and retain the result for the next control step.
     // Keep params_.lambda_ unchanged so every iteration and post-step visualization in this
     // control cycle uses the same temperature.
-    if (lambda_adaptation_enabled_ && opt_iter == this->getNumIters() - 1 &&
+    if (lambda_adaptation_enabled_ && opt_iter == num_iterations - 1 &&
         !iteration_effective_sample_sizes_.empty())
     {
-      if (weight_stats_h_->unsafe_rollout_fraction >= unsafe_rollout_fraction_threshold_)
+      if (weight_stats.unsafe_rollout_fraction >= unsafe_rollout_fraction_threshold_)
       {
         // Panic melt only when the rollout population itself reports unavoidable safety contact.
         last_weight_lambda_ = lambda_max_;
@@ -340,7 +362,8 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
 
   // Copy back sampled trajectories
   this->copySampledControlFromDevice(false);
-  if (this->getKernelChoiceAsEnum() == kernelType::USE_SINGLE_KERNEL)
+  if (this->getKernelChoiceAsEnum() == kernelType::USE_SINGLE_KERNEL &&
+      this->getTotalSampledTrajectories() > 0)
   {  // copy initial state to vis initial state for use with visualizeKernel
     HANDLE_ERROR(cudaMemcpyAsync(this->vis_initial_state_d_, this->initial_state_d_, sizeof(float) * DYN_T::STATE_DIM,
                                  cudaMemcpyDeviceToDevice, this->vis_stream_));
@@ -356,10 +379,33 @@ VANILLA_MPPI_TEMPLATE
 void VanillaMPPI::allocateCUDAMemory()
 {
   PARENT_CLASS::allocateCUDAMemoryHelper();
-  HANDLE_ERROR(cudaMalloc((void**)&weight_stats_d_, sizeof(mppi::kernels::CostWeightStats)));
+  ensureWeightStatsCapacity(std::max(1, this->getNumIters()));
   HANDLE_ERROR(cudaMalloc((void**)&rollout_crash_status_d_, NUM_ROLLOUTS * sizeof(int)));
-  HANDLE_ERROR(cudaMallocHost((void**)&weight_stats_h_, sizeof(mppi::kernels::CostWeightStats)));
-  *weight_stats_h_ = {};
+}
+
+VANILLA_MPPI_TEMPLATE
+void VanillaMPPI::ensureWeightStatsCapacity(int required_capacity)
+{
+  required_capacity = std::max(1, required_capacity);
+  if (weight_stats_capacity_ >= required_capacity)
+  {
+    return;
+  }
+  if (weight_stats_d_ != nullptr)
+  {
+    HANDLE_ERROR(cudaFree(weight_stats_d_));
+  }
+  if (weight_stats_h_ != nullptr)
+  {
+    HANDLE_ERROR(cudaFreeHost(weight_stats_h_));
+  }
+  HANDLE_ERROR(cudaMalloc((void**)&weight_stats_d_,
+                          static_cast<std::size_t>(required_capacity) * sizeof(*weight_stats_d_)));
+  HANDLE_ERROR(cudaMallocHost((void**)&weight_stats_h_,
+                              static_cast<std::size_t>(required_capacity) * sizeof(*weight_stats_h_)));
+  weight_stats_capacity_ = required_capacity;
+  last_weight_stats_index_ = 0;
+  std::fill_n(weight_stats_h_, weight_stats_capacity_, mppi::kernels::CostWeightStats{});
 }
 
 VANILLA_MPPI_TEMPLATE

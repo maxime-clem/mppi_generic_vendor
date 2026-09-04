@@ -336,10 +336,16 @@ __global__ void rolloutCostKernel(const COST_T* __restrict__ costs, SAMPLING_T* 
       ((global_idx + num_rollouts * thread_idz) * num_timesteps + t) * COST_T::OUTPUT_DIM, COST_T::OUTPUT_DIM);
   __syncthreads();
 #endif
-  // Compute terminal cost and the final cost for each thread
-  computeAndSaveCost(num_rollouts, num_timesteps, global_idx, costs, y, running_cost[0] / (num_timesteps), theta_c,
-                     &crash_status_shared[thread_idz * blockDim.x], trajectory_costs_d,
-                     rollout_crash_status_d);
+  // The X dimension cooperatively evaluates timesteps for one rollout. Only one X lane owns the
+  // reduced result; allowing every X lane through would redundantly evaluate terminalCost and race
+  // identical writes to the same rollout cost and crash-status entries.
+  if (thread_idx == 0)
+  {
+    computeAndSaveCost(num_rollouts, num_timesteps, global_idx, costs, y,
+                       running_cost[0] / (num_timesteps), theta_c,
+                       &crash_status_shared[thread_idz * blockDim.x], trajectory_costs_d,
+                       rollout_crash_status_d);
+  }
 }
 
 template <class DYN_T, class SAMPLING_T>

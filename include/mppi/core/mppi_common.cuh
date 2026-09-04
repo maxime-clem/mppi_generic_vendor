@@ -35,7 +35,7 @@ struct CostWeightStats
  * Kernel functions
  *******************************************************************************************************************/
 template <class COST_T, class SAMPLING_T, bool COALESCE = true>
-__global__ void rolloutCostKernel(COST_T* __restrict__ costs, SAMPLING_T* __restrict__ sampling, float dt,
+__global__ void rolloutCostKernel(const COST_T* __restrict__ costs, SAMPLING_T* __restrict__ sampling, float dt,
                                   const int num_timesteps, const int num_rollouts, float lambda, float alpha,
                                   const float* __restrict__ y_d, float* __restrict__ trajectory_costs_d,
                                   int* __restrict__ rollout_crash_status_d);
@@ -117,13 +117,15 @@ __device__ void loadGlobalToShared(const int num_rollouts, const int blocksize_y
  * @return
  */
 template <class COST_T>
-__device__ void computeAndSaveCost(int num_rollouts, int num_timesteps, int global_idx, COST_T* costs, float* x_thread,
+__device__ void computeAndSaveCost(int num_rollouts, int num_timesteps, int global_idx,
+                                   const COST_T* __restrict__ costs, float* x_thread,
                                    float running_cost, float* theta_c, int* crash_status,
                                    float* cost_rollouts_device, int* rollout_crash_status_device);
 
 /** Compatibility overload for controllers that do not consume rollout-level safety flags. */
 template <class COST_T>
-__device__ void computeAndSaveCost(int num_rollouts, int num_timesteps, int global_idx, COST_T* costs, float* x_thread,
+__device__ void computeAndSaveCost(int num_rollouts, int num_timesteps, int global_idx,
+                                   const COST_T* __restrict__ costs, float* x_thread,
                                    float running_cost, float* theta_c, float* cost_rollouts_device);
 
 /**

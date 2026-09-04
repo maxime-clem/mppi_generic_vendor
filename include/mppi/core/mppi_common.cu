@@ -5,6 +5,7 @@
 #include <mppi/utils/cuda_math_utils.cuh>
 
 #include <cfloat>
+#include <type_traits>
 
 // CUDA barriers were first implemented in CUDA 11
 #if defined(CMAKE_USE_CUDA_BARRIERS) && defined(CUDART_VERSION) && CUDART_VERSION > 11000
@@ -31,6 +32,56 @@ namespace mppi
 {
 namespace kernels
 {
+namespace detail
+{
+template <class COST_T>
+__device__ __forceinline__ void initializeCostObject(
+    const COST_T* costs, float* y, float* u, float* theta_c, float dt, std::true_type)
+{
+  costs->initializeCosts(y, u, theta_c, 0.0f, dt);
+}
+
+template <class COST_T>
+__device__ __forceinline__ void initializeCostObject(
+    const COST_T* costs, float* y, float* u, float* theta_c, float dt, std::false_type)
+{
+  // Compatibility path for legacy cost implementations whose logically read-only API predates
+  // const-qualified device methods.
+  const_cast<COST_T*>(costs)->initializeCosts(y, u, theta_c, 0.0f, dt);
+}
+
+template <class COST_T>
+__device__ __forceinline__ float computeRunningCost(
+    const COST_T* costs, float* y, float* u, int timestep, float* theta_c,
+    int* crash_status, std::true_type)
+{
+  return costs->computeRunningCost(y, u, timestep, theta_c, crash_status);
+}
+
+template <class COST_T>
+__device__ __forceinline__ float computeRunningCost(
+    const COST_T* costs, float* y, float* u, int timestep, float* theta_c,
+    int* crash_status, std::false_type)
+{
+  return const_cast<COST_T*>(costs)->computeRunningCost(
+      y, u, timestep, theta_c, crash_status);
+}
+
+template <class COST_T>
+__device__ __forceinline__ float terminalCost(
+    const COST_T* costs, float* output, float* theta_c, std::true_type)
+{
+  return costs->terminalCost(output, theta_c);
+}
+
+template <class COST_T>
+__device__ __forceinline__ float terminalCost(
+    const COST_T* costs, float* output, float* theta_c, std::false_type)
+{
+  return const_cast<COST_T*>(costs)->terminalCost(output, theta_c);
+}
+}  // namespace detail
+
 /*******************************************************************************************************************
  * Kernel Functions
  *******************************************************************************************************************/
@@ -156,7 +207,7 @@ __global__ void rolloutKernel(DYN_T* __restrict__ dynamics, SAMPLING_T* __restri
 }
 
 template <class COST_T, class SAMPLING_T, bool COALESCE>
-__global__ void rolloutCostKernel(COST_T* __restrict__ costs, SAMPLING_T* __restrict__ sampling, float dt,
+__global__ void rolloutCostKernel(const COST_T* __restrict__ costs, SAMPLING_T* __restrict__ sampling, float dt,
                                   const int num_timesteps, const int num_rollouts, float lambda, float alpha,
                                   const float* __restrict__ y_d, float* __restrict__ trajectory_costs_d,
                                   int* __restrict__ rollout_crash_status_d)
@@ -213,7 +264,8 @@ __global__ void rolloutCostKernel(COST_T* __restrict__ costs, SAMPLING_T* __rest
 #else
   const int max_time_iters = ceilf((float)num_timesteps / blockDim.x);
 #endif
-  costs->initializeCosts(y, u, theta_c, 0.0f, dt);
+  using ReadOnlyCost = std::integral_constant<bool, COST_T::COST_OBJECT_READ_ONLY>;
+  detail::initializeCostObject(costs, y, u, theta_c, dt, ReadOnlyCost{});
   sampling->initializeDistributions(y, 0.0f, dt, theta_d);
   __syncthreads();
   for (int time_iter = 0; time_iter < max_time_iters; ++time_iter)
@@ -246,7 +298,7 @@ __global__ void rolloutCostKernel(COST_T* __restrict__ costs, SAMPLING_T* __rest
     if (t < num_timesteps)
     {
       running_cost[0] +=
-          costs->computeRunningCost(y, u, t, theta_c, crash_status) +
+          detail::computeRunningCost(costs, y, u, t, theta_c, crash_status, ReadOnlyCost{}) +
           sampling->computeLikelihoodRatioCost(u, theta_d, global_idx, t, distribution_idx, lambda, alpha);
     }
 #ifdef USE_CUDA_BARRIERS_COST
@@ -865,7 +917,8 @@ __device__ void loadGlobalToShared(const int num_rollouts, const int blocksize_y
 }
 
 template <class COST_T>
-__device__ void computeAndSaveCost(int num_rollouts, int num_timesteps, int global_idx, COST_T* costs, float* output,
+__device__ void computeAndSaveCost(int num_rollouts, int num_timesteps, int global_idx,
+                                   const COST_T* __restrict__ costs, float* output,
                                    float running_cost, float* theta_c, int* crash_status,
                                    float* cost_rollouts_device, int* rollout_crash_status_device)
 {
@@ -873,7 +926,11 @@ __device__ void computeAndSaveCost(int num_rollouts, int num_timesteps, int glob
   if (threadIdx.y == 0 && global_idx < num_rollouts)
   {
     cost_rollouts_device[global_idx + num_rollouts * threadIdx.z] =
-        running_cost + costs->terminalCost(output, theta_c) / (num_timesteps);
+        running_cost +
+        detail::terminalCost(
+            costs, output, theta_c,
+            std::integral_constant<bool, COST_T::COST_OBJECT_READ_ONLY>{}) /
+            (num_timesteps);
     if (rollout_crash_status_device != nullptr)
     {
       rollout_crash_status_device[global_idx + num_rollouts * threadIdx.z] =
@@ -883,7 +940,8 @@ __device__ void computeAndSaveCost(int num_rollouts, int num_timesteps, int glob
 }
 
 template <class COST_T>
-__device__ void computeAndSaveCost(int num_rollouts, int num_timesteps, int global_idx, COST_T* costs, float* output,
+__device__ void computeAndSaveCost(int num_rollouts, int num_timesteps, int global_idx,
+                                   const COST_T* __restrict__ costs, float* output,
                                    float running_cost, float* theta_c, float* cost_rollouts_device)
 {
   computeAndSaveCost(num_rollouts, num_timesteps, global_idx, costs, output, running_cost, theta_c, nullptr,

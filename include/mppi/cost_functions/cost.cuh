@@ -35,6 +35,8 @@ template <class CLASS_T, class PARAMS_T, class DYN_PARAMS_T = DynamicsParams>
 class Cost : public Managed
 {
 public:
+  /** Override when all device evaluation methods are const-qualified and leave the object immutable. */
+  static constexpr bool COST_OBJECT_READ_ONLY = false;
   //  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
   /**

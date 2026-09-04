@@ -3,6 +3,7 @@
  **/
 
 #include <mppi/sampling_distributions/gaussian/gaussian.cuh>
+#include <mppi/utils/nvtx.cuh>
 #include <mppi/core/mppi_common.cuh>
 #include <mppi/utils/cuda_math_utils.cuh>
 #include <mppi/utils/math_utils.h>
@@ -326,7 +327,10 @@ __host__ void GAUSSIAN_CLASS::allocateCUDAMemoryHelper()
     HANDLE_ERROR(cudaMalloc((void**)&control_means_d_,
                             sizeof(float) * this->getNumDistributions() * this->getNumTimesteps() * CONTROL_DIM));
 #endif
-    means_.resize(this->getNumDistributions() * this->getNumTimesteps() * CONTROL_DIM);
+    const std::size_t control_mean_count =
+        static_cast<std::size_t>(this->getNumDistributions()) * this->getNumTimesteps() * CONTROL_DIM;
+    pinned_control_means_.resize(control_mean_count);
+    means_.resize(control_mean_count);
     // Ensure that the device side point knows where the the standard deviation memory is located
     HANDLE_ERROR(cudaMemcpyAsync(&this->sampling_d_->std_dev_d_, &std_dev_d_, sizeof(float*), cudaMemcpyHostToDevice,
                                  this->stream_));
@@ -345,6 +349,8 @@ __host__ void GAUSSIAN_CLASS::freeCudaMem()
     control_means_d_ = nullptr;
     std_dev_d_ = nullptr;
   }
+  pinned_control_means_.reset();
+  means_.clear();
   PARENT_CLASS::freeCudaMem();
 }
 
@@ -484,15 +490,73 @@ __host__ void GAUSSIAN_CLASS::setHostOptimalControlSequence(float* optimal_contr
     return;
   }
 
-  HANDLE_ERROR(cudaMemcpyAsync(
-      optimal_control_trajectory, &(this->control_means_d_[this->getNumTimesteps() * CONTROL_DIM * distribution_i]),
-      sizeof(float) * this->getNumTimesteps() * CONTROL_DIM, cudaMemcpyDeviceToHost, this->stream_));
-  if (synchronize)
+  if (!synchronize)
   {
-    HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
-    std::copy_n(optimal_control_trajectory, this->getNumTimesteps() * CONTROL_DIM,
-                &means_[this->getNumTimesteps() * CONTROL_DIM * distribution_i]);
+    {
+      mppi::instrumentation::ScopedNvtxRange enqueue_range(
+          "MPPI/final_result_enqueue_control", mppi::instrumentation::NvtxColor::DATA_TRANSFER);
+      HANDLE_ERROR(cudaMemcpyAsync(
+          optimal_control_trajectory,
+          &(this->control_means_d_[this->getNumTimesteps() * CONTROL_DIM * distribution_i]),
+          sizeof(float) * this->getNumTimesteps() * CONTROL_DIM, cudaMemcpyDeviceToHost, this->stream_));
+    }
+    return;
   }
+
+  enqueueOptimalControlSequenceDownload(distribution_i);
+  waitForOptimalControlSequenceDownload();
+  finalizeOptimalControlSequenceDownload(optimal_control_trajectory, distribution_i);
+}
+
+GAUSSIAN_TEMPLATE
+__host__ void GAUSSIAN_CLASS::enqueueOptimalControlSequenceDownload(const int& distribution_i)
+{
+  if (distribution_i >= this->getNumDistributions())
+  {
+    this->logger_->error(
+        "Asking for optimal control sequence from distribution %d out of %d total. Distribution out of bounds.\n",
+        distribution_i, this->getNumDistributions());
+    return;
+  }
+
+  const std::size_t distribution_offset =
+      static_cast<std::size_t>(this->getNumTimesteps()) * CONTROL_DIM * distribution_i;
+  const std::size_t control_count = static_cast<std::size_t>(this->getNumTimesteps()) * CONTROL_DIM;
+  mppi::instrumentation::ScopedNvtxRange enqueue_range(
+      "MPPI/final_result_enqueue_control", mppi::instrumentation::NvtxColor::DATA_TRANSFER);
+  HANDLE_ERROR(cudaMemcpyAsync(pinned_control_means_.data() + distribution_offset,
+                               this->control_means_d_ + distribution_offset, control_count * sizeof(float),
+                               cudaMemcpyDeviceToHost, this->stream_));
+}
+
+GAUSSIAN_TEMPLATE
+__host__ void GAUSSIAN_CLASS::waitForOptimalControlSequenceDownload()
+{
+  mppi::instrumentation::ScopedNvtxRange wait_range(
+      "MPPI/final_result_wait", mppi::instrumentation::NvtxColor::DATA_TRANSFER);
+  HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
+}
+
+GAUSSIAN_TEMPLATE
+__host__ void GAUSSIAN_CLASS::finalizeOptimalControlSequenceDownload(float* optimal_control_trajectory,
+                                                                    const int& distribution_i)
+{
+  if (distribution_i >= this->getNumDistributions())
+  {
+    this->logger_->error(
+        "Asking for optimal control sequence from distribution %d out of %d total. Distribution out of bounds.\n",
+        distribution_i, this->getNumDistributions());
+    return;
+  }
+
+  const std::size_t distribution_offset =
+      static_cast<std::size_t>(this->getNumTimesteps()) * CONTROL_DIM * distribution_i;
+  const std::size_t control_count = static_cast<std::size_t>(this->getNumTimesteps()) * CONTROL_DIM;
+  const float* staged_control = pinned_control_means_.data() + distribution_offset;
+  mppi::instrumentation::ScopedNvtxRange host_copy_range(
+      "MPPI/final_result_host_copy", mppi::instrumentation::NvtxColor::DATA_TRANSFER);
+  std::copy_n(staged_control, control_count, optimal_control_trajectory);
+  std::copy_n(staged_control, control_count, means_.data() + distribution_offset);
 }
 
 GAUSSIAN_TEMPLATE

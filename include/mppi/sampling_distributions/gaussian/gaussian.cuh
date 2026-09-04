@@ -4,6 +4,7 @@
  **/
 
 #include <mppi/sampling_distributions/sampling_distribution.cuh>
+#include <mppi/utils/pinned_host_buffer.cuh>
 
 #include <vector>
 
@@ -149,6 +150,16 @@ public:
   __host__ void setHostOptimalControlSequence(float* optimal_control_trajectory, const int& distribution_idx,
                                               bool synchronize = true);
 
+  /** Queue the final control mean into the sampler-owned pinned host staging buffer. */
+  __host__ void enqueueOptimalControlSequenceDownload(const int& distribution_idx);
+
+  /** Wait for all work previously queued on the sampling stream, including the staged download. */
+  __host__ void waitForOptimalControlSequenceDownload();
+
+  /** Copy a completed staged download to the caller and update the sampler's host mirror. */
+  __host__ void finalizeOptimalControlSequenceDownload(float* optimal_control_trajectory,
+                                                       const int& distribution_idx);
+
   __host__ void setNumDistributions(const int num_distributions, bool synchronize = false)
   {
     if (num_distributions > SAMPLING_PARAMS_T::MAX_DISTRIBUTIONS)
@@ -170,6 +181,7 @@ public:
 protected:
   float* std_dev_d_ = nullptr;
   float* control_means_d_ = nullptr;
+  mppi::memory::PinnedHostBuffer<float> pinned_control_means_;
   std::vector<float> means_;
 };
 

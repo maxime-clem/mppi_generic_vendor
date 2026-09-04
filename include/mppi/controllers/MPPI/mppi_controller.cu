@@ -1,6 +1,7 @@
 #include <atomic>
 #include <mppi/controllers/MPPI/mppi_controller.cuh>
 #include <mppi/core/mppi_common.cuh>
+#include <mppi/utils/nvtx.cuh>
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -140,8 +141,8 @@ void VanillaMPPI::chooseAppropriateKernel()
     kernel_choice = "single";
   }
   this->logger_->info("Choosing %s kernel based on split taking %f ms and single taking %f ms after %d iterations\n",
-                     kernel_choice.c_str(), split_kernel_time_ms, single_kernel_time_ms,
-                     this->getNumKernelEvaluations());
+                      kernel_choice.c_str(), split_kernel_time_ms, single_kernel_time_ms,
+                      this->getNumKernelEvaluations());
 }
 
 VANILLA_MPPI_TEMPLATE
@@ -165,19 +166,16 @@ VanillaMPPI::~VanillaMPPIController()
 }
 
 VANILLA_MPPI_TEMPLATE
-void VanillaMPPI::configureEssLambdaAdaptation(float target_ess_ratio, float adaptation_gain,
-                                               float lambda_min, float lambda_max,
-                                               float unsafe_rollout_fraction_threshold,
+void VanillaMPPI::configureEssLambdaAdaptation(float target_ess_ratio, float adaptation_gain, float lambda_min,
+                                               float lambda_max, float unsafe_rollout_fraction_threshold,
                                                float cost_normalization_percentile)
 {
   target_ess_ratio_ = std::max(0.0F, std::min(1.0F, target_ess_ratio));
   lambda_adaptation_gain_ = std::max(0.0F, adaptation_gain);
   lambda_min_ = std::max(1.0E-6F, lambda_min);
   lambda_max_ = std::max(lambda_min_, lambda_max);
-  unsafe_rollout_fraction_threshold_ =
-      std::max(0.0F, std::min(1.0F, unsafe_rollout_fraction_threshold));
-  cost_normalization_percentile_ =
-      std::max(0.0F, std::min(1.0F, cost_normalization_percentile));
+  unsafe_rollout_fraction_threshold_ = std::max(0.0F, std::min(1.0F, unsafe_rollout_fraction_threshold));
+  cost_normalization_percentile_ = std::max(0.0F, std::min(1.0F, cost_normalization_percentile));
   lambda_adaptation_enabled_ = true;
   last_weight_lambda_ = std::max(lambda_min_, std::min(lambda_max_, this->getLambda()));
   last_iteration_weight_lambda_ = last_weight_lambda_;
@@ -187,8 +185,8 @@ void VanillaMPPI::configureEssLambdaAdaptation(float target_ess_ratio, float ada
 VANILLA_MPPI_TEMPLATE
 void VanillaMPPI::downloadImportanceWeightsToHost()
 {
-  HANDLE_ERROR(cudaMemcpyAsync(this->trajectory_costs_.data(), this->trajectory_costs_d_,
-                               NUM_ROLLOUTS * sizeof(float), cudaMemcpyDeviceToHost, this->stream_));
+  HANDLE_ERROR(cudaMemcpyAsync(this->trajectory_costs_.data(), this->trajectory_costs_d_, NUM_ROLLOUTS * sizeof(float),
+                               cudaMemcpyDeviceToHost, this->stream_));
   HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
 }
 
@@ -205,12 +203,11 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
                                cudaMemcpyHostToDevice, this->stream_));
 
   const float rollout_count = std::max(static_cast<float>(NUM_ROLLOUTS), 1.0F);
-  float baseline_prev = std::isfinite(this->free_energy_statistics_.real_sys.previousBaseline)
-                            ? this->free_energy_statistics_.real_sys.previousBaseline
-                            : 0.0F;
+  float baseline_prev = std::isfinite(this->free_energy_statistics_.real_sys.previousBaseline) ?
+                            this->free_energy_statistics_.real_sys.previousBaseline :
+                            0.0F;
   iteration_effective_sample_sizes_.clear();
-  iteration_effective_sample_sizes_.reserve(
-      static_cast<std::size_t>(num_iterations));
+  iteration_effective_sample_sizes_.reserve(static_cast<std::size_t>(num_iterations));
   // Apply the temperature prepared by the previous control step before entering the optimization
   // loop; it then remains fixed for every iteration in this step.
   if (lambda_adaptation_enabled_)
@@ -234,28 +231,36 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
   for (int opt_iter = 0; opt_iter < num_iterations; opt_iter++)
   {
     // Generate noise data
-    this->sampler_->generateSamples(optimization_stride, opt_iter, this->gen_, false);
+    {
+      mppi::instrumentation::ScopedNvtxRange range("MPPI/random_sampling", mppi::instrumentation::NvtxColor::SAMPLING);
+      this->sampler_->generateSamples(optimization_stride, opt_iter, this->gen_, false);
+    }
 
     // Launch the rollout kernel
-    if (this->getKernelChoiceAsEnum() == kernelType::USE_SPLIT_KERNELS)
     {
-      mppi::kernels::launchSplitRolloutKernel<DYN_T, COST_T, SAMPLING_T>(
-          this->model_, this->cost_, this->sampler_, this->getDt(), this->getNumTimesteps(), NUM_ROLLOUTS,
-          this->getLambda(), this->getAlpha(), this->initial_state_d_, this->output_d_, this->trajectory_costs_d_,
-          this->params_.dynamics_rollout_dim_, this->params_.cost_rollout_dim_, this->stream_, false,
-          rollout_crash_status_d_);
-    }
-    else if (this->getKernelChoiceAsEnum() == kernelType::USE_SINGLE_KERNEL)
-    {
-      mppi::kernels::launchRolloutKernel<DYN_T, COST_T, SAMPLING_T>(
-          this->model_, this->cost_, this->sampler_, this->getDt(), this->getNumTimesteps(), NUM_ROLLOUTS,
-          this->getLambda(), this->getAlpha(), this->initial_state_d_, this->trajectory_costs_d_,
-          this->params_.dynamics_rollout_dim_, this->stream_, false, rollout_crash_status_d_);
+      mppi::instrumentation::ScopedNvtxRange range("MPPI/rollout", mppi::instrumentation::NvtxColor::ROLLOUT);
+      if (this->getKernelChoiceAsEnum() == kernelType::USE_SPLIT_KERNELS)
+      {
+        mppi::kernels::launchSplitRolloutKernel<DYN_T, COST_T, SAMPLING_T>(
+            this->model_, this->cost_, this->sampler_, this->getDt(), this->getNumTimesteps(), NUM_ROLLOUTS,
+            this->getLambda(), this->getAlpha(), this->initial_state_d_, this->output_d_, this->trajectory_costs_d_,
+            this->params_.dynamics_rollout_dim_, this->params_.cost_rollout_dim_, this->stream_, false,
+            rollout_crash_status_d_);
+      }
+      else if (this->getKernelChoiceAsEnum() == kernelType::USE_SINGLE_KERNEL)
+      {
+        mppi::kernels::launchRolloutKernel<DYN_T, COST_T, SAMPLING_T>(
+            this->model_, this->cost_, this->sampler_, this->getDt(), this->getNumTimesteps(), NUM_ROLLOUTS,
+            this->getLambda(), this->getAlpha(), this->initial_state_d_, this->trajectory_costs_d_,
+            this->params_.dynamics_rollout_dim_, this->stream_, false, rollout_crash_status_d_);
+      }
     }
 
     // Preserve raw rollout costs only for explicitly enabled per-iteration diagnostics.
     if (requiresRawRolloutCostsForIteration())
     {
+      mppi::instrumentation::ScopedNvtxRange range("MPPI/capture_iteration_debug",
+                                                   mppi::instrumentation::NvtxColor::DEBUG);
       HANDLE_ERROR(cudaMemcpyAsync(this->trajectory_costs_.data(), this->trajectory_costs_d_,
                                    NUM_ROLLOUTS * sizeof(float), cudaMemcpyDeviceToHost, this->stream_));
       HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
@@ -264,24 +269,38 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
 
     // One device kernel computes robust-normalized exponential weights, the weight normalizer,
     // ESS, and safety statistics. The per-iteration records remain on-device until the loop ends.
-    mppi::kernels::launchMinMaxWeightKernel(
-        NUM_ROLLOUTS, this->getNormExpThreads(), this->trajectory_costs_d_,
-        rollout_crash_status_d_, 1.0F / last_iteration_weight_lambda_,
-        cost_normalization_percentile_, 1.0E-6F, weight_stats_d_ + opt_iter, this->stream_, false);
+    {
+      mppi::instrumentation::ScopedNvtxRange range("MPPI/weight_statistics",
+                                                   mppi::instrumentation::NvtxColor::STATISTICS);
+      mppi::kernels::launchMinMaxWeightKernel(NUM_ROLLOUTS, this->getNormExpThreads(), this->trajectory_costs_d_,
+                                              rollout_crash_status_d_, 1.0F / last_iteration_weight_lambda_,
+                                              cost_normalization_percentile_, 1.0E-6F, weight_stats_d_ + opt_iter,
+                                              this->stream_, false);
+    }
     // The fused kernel normalizes weights in-place; sampler reduction therefore uses unity.
     this->setNormalizer(1.0F);
 
-    this->sampler_->updateDistributionParamsFromDeviceOnly(this->trajectory_costs_d_, 1.0F, 0, false);
+    {
+      mppi::instrumentation::ScopedNvtxRange range("MPPI/weighted_control_reduction",
+                                                   mppi::instrumentation::NvtxColor::REDUCTION);
+      this->sampler_->updateDistributionParamsFromDeviceOnly(this->trajectory_costs_d_, 1.0F, 0, false);
+    }
   }
 
   if (num_iterations > 0)
   {
+    mppi::instrumentation::ScopedNvtxRange range("MPPI/final_result_download",
+                                                 mppi::instrumentation::NvtxColor::DATA_TRANSFER);
     // Queue both final results before the sampler performs the control step's only required host
     // synchronization. The optimization loop above contains no host transfers or barriers unless
     // explicit per-iteration raw-rollout diagnostics are enabled.
-    HANDLE_ERROR(cudaMemcpyAsync(weight_stats_h_, weight_stats_d_,
-                                 static_cast<std::size_t>(num_iterations) * sizeof(*weight_stats_h_),
-                                 cudaMemcpyDeviceToHost, this->stream_));
+    {
+      mppi::instrumentation::ScopedNvtxRange enqueue_range(
+          "MPPI/final_result_enqueue_weight_stats", mppi::instrumentation::NvtxColor::DATA_TRANSFER);
+      HANDLE_ERROR(cudaMemcpyAsync(weight_stats_h_, weight_stats_d_,
+                                   static_cast<std::size_t>(num_iterations) * sizeof(*weight_stats_h_),
+                                   cudaMemcpyDeviceToHost, this->stream_));
+    }
     this->sampler_->setHostOptimalControlSequence(this->control_.data(), 0, true);
     device_optimal_control_ = this->control_;
     last_weight_stats_index_ = num_iterations - 1;
@@ -313,22 +332,18 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
         -last_iteration_weight_lambda_ * std::log(std::max(mean_weight, 1.0E-12F));
 
     const float mean_raw_cost = weight_stats.raw_cost_sum / rollout_count;
-    const float mean_squared_raw_cost =
-        weight_stats.raw_cost_squared_sum / rollout_count;
-    this->free_energy_statistics_.real_sys.freeEnergyVariance = std::max(
-        0.0F, mean_squared_raw_cost - mean_raw_cost * mean_raw_cost);
-    const float variance_scale =
-        this->free_energy_statistics_.real_sys.freeEnergyVariance /
-        std::max(std::abs(mean_raw_cost) * std::sqrt(rollout_count), 1.0E-12F);
+    const float mean_squared_raw_cost = weight_stats.raw_cost_squared_sum / rollout_count;
+    this->free_energy_statistics_.real_sys.freeEnergyVariance =
+        std::max(0.0F, mean_squared_raw_cost - mean_raw_cost * mean_raw_cost);
+    const float variance_scale = this->free_energy_statistics_.real_sys.freeEnergyVariance /
+                                 std::max(std::abs(mean_raw_cost) * std::sqrt(rollout_count), 1.0E-12F);
     this->free_energy_statistics_.real_sys.freeEnergyModifiedVariance =
-        last_iteration_weight_lambda_ *
-        (variance_scale + 0.5F * variance_scale * variance_scale);
+        last_iteration_weight_lambda_ * (variance_scale + 0.5F * variance_scale * variance_scale);
 
     // Adapt only from the converged iteration, and retain the result for the next control step.
     // Keep params_.lambda_ unchanged so every iteration and post-step visualization in this
     // control cycle uses the same temperature.
-    if (lambda_adaptation_enabled_ && opt_iter == num_iterations - 1 &&
-        !iteration_effective_sample_sizes_.empty())
+    if (lambda_adaptation_enabled_ && opt_iter == num_iterations - 1 && !iteration_effective_sample_sizes_.empty())
     {
       if (weight_stats.unsafe_rollout_fraction >= unsafe_rollout_fraction_threshold_)
       {
@@ -340,16 +355,13 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
         const float ess_ratio = iteration_effective_sample_sizes_.back() / rollout_count;
         const float error = target_ess_ratio_ - ess_ratio;
         const float lambda_multiplier = std::exp(lambda_adaptation_gain_ * error);
-        last_weight_lambda_ = std::max(
-            lambda_min_, std::min(lambda_max_, last_weight_lambda_ * lambda_multiplier));
+        last_weight_lambda_ = std::max(lambda_min_, std::min(lambda_max_, last_weight_lambda_ * lambda_multiplier));
       }
     }
   }
 
   this->free_energy_statistics_.real_sys.normalizerPercent =
-      iteration_effective_sample_sizes_.empty()
-          ? 0.0F
-          : iteration_effective_sample_sizes_.back() / rollout_count;
+      iteration_effective_sample_sizes_.empty() ? 0.0F : iteration_effective_sample_sizes_.back() / rollout_count;
   this->free_energy_statistics_.real_sys.increase =
       this->getBaselineCost() - this->free_energy_statistics_.real_sys.previousBaseline;
   smoothControlTrajectory();
@@ -361,18 +373,21 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
   }
 
   // Copy back sampled trajectories
-  this->copySampledControlFromDevice(false);
-  if (this->getKernelChoiceAsEnum() == kernelType::USE_SINGLE_KERNEL &&
-      this->getTotalSampledTrajectories() > 0)
-  {  // copy initial state to vis initial state for use with visualizeKernel
-    HANDLE_ERROR(cudaMemcpyAsync(this->vis_initial_state_d_, this->initial_state_d_, sizeof(float) * DYN_T::STATE_DIM,
-                                 cudaMemcpyDeviceToDevice, this->vis_stream_));
-  }
-  if (this->num_top_control_trajectories_ > 0)
   {
-    downloadImportanceWeightsToHost();
+    mppi::instrumentation::ScopedNvtxRange range("MPPI/stage_visualization_buffers",
+                                                 mppi::instrumentation::NvtxColor::DEBUG);
+    this->copySampledControlFromDevice(false);
+    if (this->getKernelChoiceAsEnum() == kernelType::USE_SINGLE_KERNEL && this->getTotalSampledTrajectories() > 0)
+    {  // copy initial state to vis initial state for use with visualizeKernel
+      HANDLE_ERROR(cudaMemcpyAsync(this->vis_initial_state_d_, this->initial_state_d_, sizeof(float) * DYN_T::STATE_DIM,
+                                   cudaMemcpyDeviceToDevice, this->vis_stream_));
+    }
+    if (this->num_top_control_trajectories_ > 0)
+    {
+      downloadImportanceWeightsToHost();
+    }
+    this->copyTopControlFromDevice(true);
   }
-  this->copyTopControlFromDevice(true);
 }
 
 VANILLA_MPPI_TEMPLATE
@@ -399,10 +414,10 @@ void VanillaMPPI::ensureWeightStatsCapacity(int required_capacity)
   {
     HANDLE_ERROR(cudaFreeHost(weight_stats_h_));
   }
-  HANDLE_ERROR(cudaMalloc((void**)&weight_stats_d_,
-                          static_cast<std::size_t>(required_capacity) * sizeof(*weight_stats_d_)));
-  HANDLE_ERROR(cudaMallocHost((void**)&weight_stats_h_,
-                              static_cast<std::size_t>(required_capacity) * sizeof(*weight_stats_h_)));
+  HANDLE_ERROR(
+      cudaMalloc((void**)&weight_stats_d_, static_cast<std::size_t>(required_capacity) * sizeof(*weight_stats_d_)));
+  HANDLE_ERROR(
+      cudaMallocHost((void**)&weight_stats_h_, static_cast<std::size_t>(required_capacity) * sizeof(*weight_stats_h_)));
   weight_stats_capacity_ = required_capacity;
   last_weight_stats_index_ = 0;
   std::fill_n(weight_stats_h_, weight_stats_capacity_, mppi::kernels::CostWeightStats{});
@@ -445,6 +460,8 @@ void VanillaMPPI::launchSampledVisTrajectories()
 VANILLA_MPPI_TEMPLATE
 void VanillaMPPI::calculateSampledStateTrajectories()
 {
+  mppi::instrumentation::ScopedNvtxRange range("MPPI/build_sampled_trajectories",
+                                               mppi::instrumentation::NvtxColor::DEBUG);
   launchSampledVisTrajectories();
   this->downloadSampledVisTrajectoriesToHost();
 }

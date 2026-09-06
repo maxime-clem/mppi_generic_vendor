@@ -423,13 +423,7 @@ public:
    * Method to allow setup of dynamics on the GPU. This is needed for
    * initializing the memory of an LSTM for example
    */
-  __device__ void initializeDynamics(float* state, float* control, float* output, float* theta_s, float t_0, float dt)
-  {
-    for (int i = 0; i < OUTPUT_DIM && i < STATE_DIM; i++)
-    {
-      output[i] = state[i];
-    }
-  }
+  __device__ void initializeDynamics(float* state, float* control, float* output, float* theta_s, float t_0, float dt);
 
   /**
    * Method to compute an emergency stopping control

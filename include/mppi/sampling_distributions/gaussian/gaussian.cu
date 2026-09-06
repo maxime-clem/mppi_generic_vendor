@@ -44,6 +44,11 @@ __global__ void setGaussianControls(const float* __restrict__ mean_d, const floa
   shared_std_dev_index = time_specific_std_dev ? shared_std_dev_index : 0;
   global_std_dev_index = time_specific_std_dev ? global_std_dev_index : 0;
   std_dev_size = time_specific_std_dev ? num_timesteps * std_dev_size : std_dev_size;
+  // Time-independent variance uses a single shared slot across Y/Z. Time-dependent slots
+  // have distinct Y/Z owners; X workers partition the control components in either case.
+  const bool load_std_dev = time_specific_std_dev
+                                ? time_index < num_timesteps && distribution_index < num_distributions
+                                : threadIdx.y == 0 && threadIdx.z == 0;
 
   // local variables
   int i, j, k;
@@ -82,11 +87,14 @@ __global__ void setGaussianControls(const float* __restrict__ mean_d, const floa
     }
 
     // Step 2: load std_dev to shared memory
-    const float4* std_dev_d4 = reinterpret_cast<const float4*>(&std_dev_d[global_std_dev_index]);
     float4* std_dev_shared4 = reinterpret_cast<float4*>(&std_dev_shared[shared_std_dev_index]);
-    for (i = threadIdx.x; i < control_dim / 4; i += blockDim.x)
+    if (load_std_dev)
     {
-      std_dev_shared4[i] = std_dev_decay * std_dev_d4[i];
+      const float4* std_dev_d4 = reinterpret_cast<const float4*>(&std_dev_d[global_std_dev_index]);
+      for (i = threadIdx.x; i < control_dim / 4; i += blockDim.x)
+      {
+        std_dev_shared4[i] = std_dev_decay * std_dev_d4[i];
+      }
     }
 
     // Step 3: load noise into shared memory
@@ -147,11 +155,14 @@ __global__ void setGaussianControls(const float* __restrict__ mean_d, const floa
     }
 
     // Step 2: load std_dev to shared memory
-    const float2* std_dev_d2 = reinterpret_cast<const float2*>(&std_dev_d[global_std_dev_index]);
     float2* std_dev_shared2 = reinterpret_cast<float2*>(&std_dev_shared[shared_std_dev_index]);
-    for (i = threadIdx.x; i < control_dim / 2; i += blockDim.x)
+    if (load_std_dev)
     {
-      std_dev_shared2[i] = std_dev_decay * std_dev_d2[i];
+      const float2* std_dev_d2 = reinterpret_cast<const float2*>(&std_dev_d[global_std_dev_index]);
+      for (i = threadIdx.x; i < control_dim / 2; i += blockDim.x)
+      {
+        std_dev_shared2[i] = std_dev_decay * std_dev_d2[i];
+      }
     }
 
     // Step 3: load noise into shared memory
@@ -221,7 +232,7 @@ __global__ void setGaussianControls(const float* __restrict__ mean_d, const floa
     // __syncthreads();
 
     // Step 2: load std_dev to shared memory
-    for (i = threadIdx.x; i < control_dim; i += blockDim.x)
+    for (i = threadIdx.x; load_std_dev && i < control_dim; i += blockDim.x)
     {
       std_dev_shared[shared_std_dev_index + i] = std_dev_decay * std_dev_d[global_std_dev_index + i];
     }

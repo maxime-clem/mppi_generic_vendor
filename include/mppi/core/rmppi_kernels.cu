@@ -96,17 +96,16 @@ __global__ void initEvalDynKernel(DYN_T* __restrict__ dynamics, SAMPLING_T* __re
 
     // Increment states
     dynamics->step(x, x_next, xdot, u, y, theta_s_shared, t, dt);
-#ifdef USE_CUDA_BARRIERS_DYN
-    bar->arrive_and_wait();
-#else
+    // Publish the shared output vector to all cooperative copy workers.
     __syncthreads();
-#endif
     x_temp = x;
     x = x_next;
     x_next = x_temp;
     // Copy state to global memory
     int sample_time_offset = (num_rollouts * threadIdx.z + global_idx) * num_timesteps + t;
     mp1::loadArrayParallel<DYN_T::OUTPUT_DIM>(y_d, sample_time_offset * DYN_T::OUTPUT_DIM, y, 0);
+    // Do not reuse shared output storage until every copy worker has finished reading it.
+    __syncthreads();
   }
 }
 
@@ -466,11 +465,8 @@ __global__ void rolloutRMPPIDynamicsKernel(DYN_T* __restrict__ dynamics, FB_T* _
 
     // Increment states
     dynamics->step(x, x_next, xdot, u, y, theta_s_shared, t, dt);
-#ifdef USE_CUDA_BARRIERS_DYN
-    bar->arrive_and_wait();
-#else
+    // Publish the shared output vector to all cooperative copy workers.
     __syncthreads();
-#endif
     x_temp = x;
     x = x_next;
     x_next = x_temp;
@@ -480,6 +476,8 @@ __global__ void rolloutRMPPIDynamicsKernel(DYN_T* __restrict__ dynamics, FB_T* _
     // Copy state to global memory
     int sample_time_offset = (num_rollouts * thread_idz + global_idx) * num_timesteps + t;
     mp1::loadArrayParallel<DYN_T::OUTPUT_DIM>(y_d, sample_time_offset * DYN_T::OUTPUT_DIM, y, 0);
+    // Do not reuse shared output storage until every copy worker has finished reading it.
+    __syncthreads();
   }
 }
 
@@ -525,6 +523,7 @@ __global__ void rolloutRMPPICostKernel(COST_T* __restrict__ costs, DYN_T* __rest
   // Load global array to shared array
   float* y = &y_shared[shared_idx * COST_T::OUTPUT_DIM];
   float* y_nom = &y_shared[(blockDim.x * NOMINAL_STATE_IDX + thread_idx) * COST_T::OUTPUT_DIM];
+  // readControlSample fills this vector cooperatively across Y workers.
   float* u = &u_shared[shared_idx * COST_T::CONTROL_DIM];
   int* crash_status = &crash_status_shared[shared_idx];
   const int cost_index = blockDim.x * (thread_idz * blockDim.y + thread_idy) + thread_idx;

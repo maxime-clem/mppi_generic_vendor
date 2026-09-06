@@ -188,24 +188,26 @@ void CONTROLLER::setCUDAStream(cudaStream_t stream)
   cost_->bindToStream(stream);
   fb_controller_->bindToStream(stream);
   sampler_->bindToStream(stream);
-  curandSetStream(gen_, stream);  // requires the generator to be created!
+  HANDLE_CURAND_ERROR(curandSetStream(gen_, stream));  // requires the generator to be created!
 }
 
 CONTROLLER_TEMPLATE
 void CONTROLLER::createAndSeedCUDARandomNumberGen()
 {
-  // Seed the PseudoRandomGenerator with the CPU time.
-  curandCreateGenerator(&gen_, CURAND_RNG_PSEUDO_DEFAULT);
+  if (!gen_owner_)
+  {
+    HANDLE_CURAND_ERROR(curandCreateGenerator(&gen_, CURAND_RNG_PSEUDO_DEFAULT));
+    gen_owner_.reset(gen_);
+  }
   setSeedCUDARandomNumberGen(this->params_.seed_);
 }
 
 CONTROLLER_TEMPLATE
 void CONTROLLER::setSeedCUDARandomNumberGen(unsigned seed)
 {
-  // Seed the PseudoRandomGenerator with the CPU time.
-  curandSetPseudoRandomGeneratorSeed(gen_, seed);
+  HANDLE_CURAND_ERROR(curandSetPseudoRandomGeneratorSeed(gen_, seed));
   // Reset the offset so setting the seed multiple times returns the same samples
-  curandSetGeneratorOffset(gen_, 0);
+  HANDLE_CURAND_ERROR(curandSetGeneratorOffset(gen_, 0));
 }
 
 CONTROLLER_TEMPLATE

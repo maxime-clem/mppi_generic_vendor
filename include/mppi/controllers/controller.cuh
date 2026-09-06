@@ -17,6 +17,8 @@
 #include <mppi/utils/math_utils.h>
 
 #include <cfloat>
+#include <memory>
+#include <type_traits>
 #include <utility>
 
 struct freeEnergyEstimate
@@ -71,6 +73,28 @@ template <class DYN_T, class COST_T, class FB_T, class SAMPLING_T, int MAX_TIMES
           class PARAMS_T = ControllerParams<DYN_T::STATE_DIM, DYN_T::CONTROL_DIM, MAX_TIMESTEPS>>
 class Controller
 {
+  struct CudaStreamDeleter
+  {
+    void operator()(cudaStream_t stream) const noexcept
+    {
+      gpuAssert(cudaStreamSynchronize(stream), __FILE__, __LINE__, false);
+      gpuAssert(cudaStreamDestroy(stream), __FILE__, __LINE__, false);
+    }
+  };
+
+  struct CurandGeneratorDeleter
+  {
+    void operator()(curandGenerator_t generator) const noexcept
+    {
+      curandAssert(curandDestroyGenerator(generator), __FILE__, __LINE__, false);
+    }
+  };
+
+  // Keep ownership separate from the raw handles used by derived controllers and sampler APIs.
+  // Declared first so these resources outlive the other controller members during destruction.
+  std::unique_ptr<std::remove_pointer_t<cudaStream_t>, CudaStreamDeleter> vis_stream_owner_;
+  std::unique_ptr<std::remove_pointer_t<curandGenerator_t>, CurandGeneratorDeleter> gen_owner_;
+
 public:
   // EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
@@ -139,6 +163,7 @@ public:
     setCUDAStream(stream);
     // Create new stream for visualization purposes
     HANDLE_ERROR(cudaStreamCreate(&vis_stream_));
+    vis_stream_owner_.reset(vis_stream_);
 
     GPUSetup();
 
@@ -173,6 +198,7 @@ public:
     setCUDAStream(stream);
     // Create new stream for visualization purposes
     HANDLE_ERROR(cudaStreamCreate(&vis_stream_));
+    vis_stream_owner_.reset(vis_stream_);
 
     GPUSetup();
 
@@ -805,8 +831,8 @@ public:
   COST_T* cost_ = nullptr;
   FB_T* fb_controller_ = nullptr;
   SAMPLING_T* sampler_ = nullptr;
-  cudaStream_t stream_;
-  cudaStream_t vis_stream_;
+  cudaStream_t stream_ = nullptr;      // Borrowed execution stream.
+  cudaStream_t vis_stream_ = nullptr;  // Non-owning alias of vis_stream_owner_.
 
   float getDt() const
   {
@@ -976,7 +1002,7 @@ protected:
   int num_top_control_trajectories_ = 0;         // Top n sampled trajectories to visualize
   std::vector<float> top_n_costs_;
 
-  curandGenerator_t gen_;
+  curandGenerator_t gen_ = nullptr;  // Non-owning alias of gen_owner_.
   // float* control_std_dev_d_;  // Array of size DYN_T::CONTROL_DIM
   float* initial_state_d_;      // Array of sizae DYN_T::STATE_DIM * (2 if there is a nominal state)
   float* vis_initial_state_d_;  // Array of sizae DYN_T::STATE_DIM * (2 if there is a nominal state)

@@ -3,6 +3,9 @@
 #include <mppi/utils/gpu_err_chk.cuh>
 
 #include <cstddef>
+#include <new>
+#include <type_traits>
+#include <utility>
 
 namespace mppi
 {
@@ -19,12 +22,14 @@ namespace memory
 template <class T>
 class PinnedHostBuffer
 {
+  static_assert(std::is_nothrow_destructible<T>::value, "Pinned buffer elements must have noexcept destructors");
+
 public:
   PinnedHostBuffer() = default;
 
-  ~PinnedHostBuffer()
+  ~PinnedHostBuffer() noexcept
   {
-    reset();
+    release(false);
   }
 
   PinnedHostBuffer(const PinnedHostBuffer&) = delete;
@@ -45,18 +50,24 @@ public:
       void* allocation = nullptr;
       HANDLE_ERROR(cudaMallocHost(&allocation, size * sizeof(T)));
       data_ = static_cast<T*>(allocation);
-      size_ = size;
+      try
+      {
+        for (; size_ < size; ++size_)
+        {
+          ::new (static_cast<void*>(data_ + size_)) T{};
+        }
+      }
+      catch (...)
+      {
+        release(false);
+        throw;
+      }
     }
   }
 
   void reset()
   {
-    if (data_ != nullptr)
-    {
-      HANDLE_ERROR(cudaFreeHost(data_));
-      data_ = nullptr;
-      size_ = 0;
-    }
+    release(true);
   }
 
   T* data()
@@ -75,6 +86,20 @@ public:
   }
 
 private:
+  void release(const bool throw_on_error)
+  {
+    T* allocation = std::exchange(data_, nullptr);
+    std::size_t constructed = std::exchange(size_, 0);
+    if (allocation != nullptr)
+    {
+      while (constructed > 0)
+      {
+        allocation[--constructed].~T();
+      }
+      gpuAssert(cudaFreeHost(allocation), __FILE__, __LINE__, throw_on_error);
+    }
+  }
+
   T* data_ = nullptr;
   std::size_t size_ = 0;
 };

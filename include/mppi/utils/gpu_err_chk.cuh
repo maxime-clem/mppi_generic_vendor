@@ -6,6 +6,8 @@
 #include <curand.h>
 #include <device_launch_parameters.h>  // For block idx and thread idx, etc
 #include <iostream>
+#include <stdexcept>
+#include <string>
 
 #ifndef DEPRECATED
 #if __cplusplus >= 201402L
@@ -29,13 +31,16 @@
 // #endif
 // #endif
 
-inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort = true)
+inline void gpuAssert(cudaError_t code, const char* file, int line, bool throw_on_error = true)
 {
   if (code != cudaSuccess)
   {
     fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-    if (abort)
-      exit(code);
+    if (throw_on_error)
+    {
+      throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(code) + " at " + file + ":" +
+                               std::to_string(line));
+    }
   }
 }
 
@@ -45,7 +50,8 @@ inline void __cudaCheckError(const char* file, const int line)
   if (cudaSuccess != err)
   {
     fprintf(stderr, "cudaCheckError() failed at %s:%i : %s\n", file, line, cudaGetErrorString(err));
-    exit(-1);
+    throw std::runtime_error(std::string("CUDA launch error: ") + cudaGetErrorString(err) + " at " + file + ":" +
+                             std::to_string(line));
   }
 
   // More careful checking. However, this will affect performance.
@@ -54,7 +60,8 @@ inline void __cudaCheckError(const char* file, const int line)
   if (cudaSuccess != err)
   {
     fprintf(stderr, "cudaCheckError() with sync failed at %s:%i : %s\n", file, line, cudaGetErrorString(err));
-    exit(-1);
+    throw std::runtime_error(std::string("CUDA synchronization error: ") + cudaGetErrorString(err) + " at " + file +
+                             ":" + std::to_string(line));
   }
 }
 
@@ -147,26 +154,28 @@ inline const char* curandGetErrorString(curandStatus_t code)
   }
 }
 
-inline void cufftAssert(cufftResult code, const char* file, int line, bool abort = true)
+inline void cufftAssert(cufftResult code, const char* file, int line, bool throw_on_error = true)
 {
   if (code != CUFFT_SUCCESS)
   {
     fprintf(stderr, "CUFFTassert: %s %s %d\n", cufftGetErrorString(code), file, line);
-    if (abort)
+    if (throw_on_error)
     {
-      exit(code);
+      throw std::runtime_error(std::string("cuFFT error: ") + cufftGetErrorString(code) + " at " + file + ":" +
+                               std::to_string(line));
     }
   }
 }
 
-inline void curandAssert(curandStatus_t code, const char* file, int line, bool abort = true)
+inline void curandAssert(curandStatus_t code, const char* file, int line, bool throw_on_error = true)
 {
   if (code != CURAND_STATUS_SUCCESS)
   {
     fprintf(stderr, "Curandassert: %s %s %d\n", curandGetErrorString(code), file, line);
-    if (abort)
+    if (throw_on_error)
     {
-      exit(code);
+      throw std::runtime_error(std::string("cuRAND error: ") + curandGetErrorString(code) + " at " + file + ":" +
+                               std::to_string(line));
     }
   }
 }

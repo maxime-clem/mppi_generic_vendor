@@ -1062,6 +1062,11 @@ __device__ __host__ inline void normExpTransform(int num_rollouts, float* __rest
 {
   for (int i = global_idx; i < num_rollouts; i += rollout_idx_step)
   {
+    if (!isfinite(trajectory_costs_d[i]))
+    {
+      trajectory_costs_d[i] = 0.0F;
+      continue;
+    }
     float cost_dif = trajectory_costs_d[i] - baseline;
     trajectory_costs_d[i] = expf(-lambda_inv * cost_dif);
   }
@@ -1140,7 +1145,7 @@ __global__ void minMaxWeightKernel(int num_rollouts, float* __restrict__ traject
     __syncthreads();
   }
 
-  const bool has_finite_cost = min_values[0] != FLT_MAX;
+  const bool has_finite_cost = finite_counts[0] > 0;
   const float min_cost = has_finite_cost ? min_values[0] : 0.0F;
   const float max_cost = has_finite_cost ? max_values[0] : min_cost;
   const float raw_cost_sum = raw_cost_sums[0];
@@ -1231,11 +1236,11 @@ __global__ void minMaxWeightKernel(int num_rollouts, float* __restrict__ traject
     float normalized_cost = 0.0F;
     if (!isfinite(raw_cost))
     {
-      // A failed rollout must not become a best sample merely because the finite cost range is
-      // degenerate. If every rollout failed there is no meaningful ordering, so remain uniform.
-      normalized_cost = has_finite_cost ? 1.0F : 0.0F;
+      // Invalid rollouts never contribute, including when every rollout is invalid.
+      trajectory_costs_d[rollout] = 0.0F;
+      continue;
     }
-    else if (normalize_costs)
+    if (normalize_costs)
     {
       normalized_cost = (raw_cost - min_cost) / robust_cost_range;
       normalized_cost = fmaxf(0.0F, fminf(1.0F, normalized_cost));
@@ -1274,7 +1279,7 @@ __global__ void minMaxWeightKernel(int num_rollouts, float* __restrict__ traject
   if (threadIdx.x == 0)
   {
     const float squared_weight_sum = squared_weight_sums[0];
-    float effective_sample_size = static_cast<float>(num_rollouts);
+    float effective_sample_size = 0.0F;
     if (squared_weight_sum > 1.0E-12F)
     {
       effective_sample_size = weight_sum * weight_sum / squared_weight_sum;
@@ -1286,7 +1291,7 @@ __global__ void minMaxWeightKernel(int num_rollouts, float* __restrict__ traject
     stats_d->normalizer = weight_sum;
     stats_d->squared_weight_sum = squared_weight_sum;
     stats_d->effective_sample_size =
-        fmaxf(1.0F, fminf(static_cast<float>(num_rollouts), effective_sample_size));
+        fmaxf(0.0F, fminf(static_cast<float>(num_rollouts), effective_sample_size));
     stats_d->raw_cost_sum = raw_cost_sum;
     stats_d->raw_cost_squared_sum = raw_cost_squared_sum;
     stats_d->unsafe_rollout_fraction = num_rollouts > 0
@@ -1455,6 +1460,11 @@ __device__ void strideControlWeightReduction(const int num_rollouts, const int n
     if ((thread_idx * sum_stride + i) < num_rollouts)
     {                                                                        // Ensure we do not go out of bounds
       float weight = exp_costs_d[thread_idx * sum_stride + i] / normalizer;  // compute the importance sampling weight
+      if (!isfinite(weight) || weight <= 0.0F)
+      {
+        // Do not read invalid controls: even zero * NaN would poison the weighted mean.
+        continue;
+      }
       for (int j = 0; j < control_dim; ++j)
       {  // Iterate through the control dimensions
         // Rollout index: (thread_idx*sum_stride + i)*(num_timesteps*control_dim)

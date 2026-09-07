@@ -31,6 +31,54 @@
 // #endif
 // #endif
 
+// Preserve the failure category across the host API boundary. A failed CUDA execution
+// context must never be silently reused by the optimizer.
+class GpuError : public std::runtime_error
+{
+public:
+  using std::runtime_error::runtime_error;
+  virtual bool requiresProcessRestart() const noexcept
+  {
+    return false;
+  }
+};
+
+class CudaError : public GpuError
+{
+public:
+  CudaError(cudaError_t code, const char* file, int line)
+    : GpuError(std::string("CUDA error: ") + cudaGetErrorString(code) + " at " + file + ":" + std::to_string(line))
+    , code_(code)
+  {
+  }
+  cudaError_t code() const noexcept
+  {
+    return code_;
+  }
+  bool requiresProcessRestart() const noexcept override
+  {
+    switch (code_)
+    {
+      case cudaErrorIllegalAddress:
+      case cudaErrorAssert:
+      case cudaErrorLaunchFailure:
+      case cudaErrorLaunchTimeout:
+      case cudaErrorECCUncorrectable:
+      case cudaErrorHardwareStackError:
+      case cudaErrorIllegalInstruction:
+      case cudaErrorMisalignedAddress:
+      case cudaErrorInvalidAddressSpace:
+      case cudaErrorInvalidPc:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+private:
+  cudaError_t code_;
+};
+
 inline void gpuAssert(cudaError_t code, const char* file, int line, bool throw_on_error = true)
 {
   if (code != cudaSuccess)
@@ -38,9 +86,36 @@ inline void gpuAssert(cudaError_t code, const char* file, int line, bool throw_o
     fprintf(stderr, "GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
     if (throw_on_error)
     {
-      throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(code) + " at " + file + ":" +
-                               std::to_string(line));
+      throw CudaError(code, file, line);
     }
+  }
+}
+
+// Cleanup attempts every owned resource and reports failures without unwinding a destructor.
+template <class T>
+inline void cudaFreeNoThrow(T*& pointer) noexcept
+{
+  if (pointer != nullptr)
+  {
+    gpuAssert(cudaFree(pointer), __FILE__, __LINE__, false);
+    pointer = nullptr;
+  }
+}
+
+template <class F>
+inline void cleanupNoThrow(F&& cleanup) noexcept
+{
+  try
+  {
+    cleanup();
+  }
+  catch (const std::exception& error)
+  {
+    fprintf(stderr, "CUDA cleanup: %s\n", error.what());
+  }
+  catch (...)
+  {
+    fprintf(stderr, "CUDA cleanup: unknown failure\n");
   }
 }
 
@@ -50,8 +125,7 @@ inline void __cudaCheckError(const char* file, const int line)
   if (cudaSuccess != err)
   {
     fprintf(stderr, "cudaCheckError() failed at %s:%i : %s\n", file, line, cudaGetErrorString(err));
-    throw std::runtime_error(std::string("CUDA launch error: ") + cudaGetErrorString(err) + " at " + file + ":" +
-                             std::to_string(line));
+    throw CudaError(err, file, line);
   }
 
   // More careful checking. However, this will affect performance.
@@ -60,8 +134,7 @@ inline void __cudaCheckError(const char* file, const int line)
   if (cudaSuccess != err)
   {
     fprintf(stderr, "cudaCheckError() with sync failed at %s:%i : %s\n", file, line, cudaGetErrorString(err));
-    throw std::runtime_error(std::string("CUDA synchronization error: ") + cudaGetErrorString(err) + " at " + file +
-                             ":" + std::to_string(line));
+    throw CudaError(err, file, line);
   }
 }
 
@@ -161,8 +234,8 @@ inline void cufftAssert(cufftResult code, const char* file, int line, bool throw
     fprintf(stderr, "CUFFTassert: %s %s %d\n", cufftGetErrorString(code), file, line);
     if (throw_on_error)
     {
-      throw std::runtime_error(std::string("cuFFT error: ") + cufftGetErrorString(code) + " at " + file + ":" +
-                               std::to_string(line));
+      throw GpuError(std::string("cuFFT error: ") + cufftGetErrorString(code) + " at " + file + ":" +
+                     std::to_string(line));
     }
   }
 }
@@ -174,8 +247,8 @@ inline void curandAssert(curandStatus_t code, const char* file, int line, bool t
     fprintf(stderr, "Curandassert: %s %s %d\n", curandGetErrorString(code), file, line);
     if (throw_on_error)
     {
-      throw std::runtime_error(std::string("cuRAND error: ") + curandGetErrorString(code) + " at " + file + ":" +
-                               std::to_string(line));
+      throw GpuError(std::string("cuRAND error: ") + curandGetErrorString(code) + " at " + file + ":" +
+                     std::to_string(line));
     }
   }
 }

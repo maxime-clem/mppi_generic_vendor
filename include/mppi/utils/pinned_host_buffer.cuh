@@ -70,6 +70,11 @@ public:
     release(true);
   }
 
+  void resetNoThrow() noexcept
+  {
+    release(false);
+  }
+
   T* data()
   {
     return data_;

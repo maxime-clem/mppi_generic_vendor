@@ -310,16 +310,20 @@ __host__ void GAUSSIAN_CLASS::allocateCUDAMemoryHelper()
     {
 #if defined(CUDART_VERSION) && CUDART_VERSION > 11200
       HANDLE_ERROR(cudaFreeAsync(std_dev_d_, this->stream_));
+      std_dev_d_ = nullptr;
 #else
       HANDLE_ERROR(cudaFree(std_dev_d_));
+      std_dev_d_ = nullptr;
 #endif
     }
     if (control_means_d_)
     {  // deallocate previous memory control trajectory means
 #if defined(CUDART_VERSION) && CUDART_VERSION > 11200
       HANDLE_ERROR(cudaFreeAsync(control_means_d_, this->stream_));
+      control_means_d_ = nullptr;
 #else
       HANDLE_ERROR(cudaFree(control_means_d_));
+      control_means_d_ = nullptr;
 #endif
     }
 
@@ -354,13 +358,10 @@ GAUSSIAN_TEMPLATE
 __host__ void GAUSSIAN_CLASS::freeCudaMem()
 {
   if (this->GPUMemStatus_)
-  {
-    HANDLE_ERROR(cudaFree(control_means_d_));
-    HANDLE_ERROR(cudaFree(std_dev_d_));
-    control_means_d_ = nullptr;
-    std_dev_d_ = nullptr;
-  }
-  pinned_control_means_.reset();
+    gpuAssert(cudaStreamSynchronize(this->stream_), __FILE__, __LINE__, false);
+  cudaFreeNoThrow(control_means_d_);
+  cudaFreeNoThrow(std_dev_d_);
+  pinned_control_means_.resetNoThrow();
   means_.clear();
   PARENT_CLASS::freeCudaMem();
 }

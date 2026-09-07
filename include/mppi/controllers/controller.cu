@@ -10,22 +10,17 @@
 CONTROLLER_TEMPLATE
 void CONTROLLER::deallocateCUDAMemory()
 {
-  if (CUDA_mem_init_)
-  {
-    HANDLE_ERROR(cudaFree(initial_state_d_));
-    HANDLE_ERROR(cudaFree(vis_initial_state_d_));
-    HANDLE_ERROR(cudaFree(control_d_));
-    HANDLE_ERROR(cudaFree(output_d_));
-    HANDLE_ERROR(cudaFree(trajectory_costs_d_));
-    HANDLE_ERROR(cudaFree(cost_baseline_and_norm_d_));
-    CUDA_mem_init_ = false;
-  }
-  if (sampled_states_CUDA_mem_init_)
-  {
-    HANDLE_ERROR(cudaFree(sampled_outputs_d_));
-    HANDLE_ERROR(cudaFree(sampled_costs_d_));
-    sampled_states_CUDA_mem_init_ = false;
-  }
+  cudaFreeNoThrow(initial_state_d_);
+  cudaFreeNoThrow(vis_initial_state_d_);
+  cudaFreeNoThrow(control_d_);
+  cudaFreeNoThrow(output_d_);
+  cudaFreeNoThrow(trajectory_costs_d_);
+  cudaFreeNoThrow(cost_baseline_and_norm_d_);
+  cudaFreeNoThrow(sampled_outputs_d_);
+  cudaFreeNoThrow(sampled_costs_d_);
+  cudaFreeNoThrow(sampled_crash_status_d_);
+  CUDA_mem_init_ = false;
+  sampled_states_CUDA_mem_init_ = false;
 }
 
 // CONTROLLER_TEMPLATE
@@ -215,9 +210,7 @@ void CONTROLLER::allocateCUDAMemoryHelper(int nominal_size, bool allocate_double
 {
   if (nominal_size < 0)
   {
-    nominal_size = 1;
-    std::cerr << "nominal size cannot be below 0 when allocateCudaMemoryHelper is called" << std::endl;
-    std::exit(-1);
+    throw std::invalid_argument("nominal size cannot be below zero");
   }
   else
   {
@@ -246,10 +239,13 @@ void CONTROLLER::resizeSampledControlTrajectories(float perc, int multiplier, in
 
   if (sampled_states_CUDA_mem_init_)
   {
-    cudaFree(sampled_outputs_d_);
+    HANDLE_ERROR(cudaFree(sampled_outputs_d_));
+    sampled_outputs_d_ = nullptr;
     // cudaFree(sampled_noise_d_);
-    cudaFree(sampled_costs_d_);
-    cudaFree(sampled_crash_status_d_);
+    HANDLE_ERROR(cudaFree(sampled_costs_d_));
+    sampled_costs_d_ = nullptr;
+    HANDLE_ERROR(cudaFree(sampled_crash_status_d_));
+    sampled_crash_status_d_ = nullptr;
     sampled_states_CUDA_mem_init_ = false;
   }
   sampled_trajectories_.resize(num_sampled_trajectories * multiplier, output_trajectory::Zero());

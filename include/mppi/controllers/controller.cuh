@@ -165,7 +165,18 @@ public:
     HANDLE_ERROR(cudaStreamCreate(&vis_stream_));
     vis_stream_owner_.reset(vis_stream_);
 
-    GPUSetup();
+    try
+    {
+      GPUSetup();
+    }
+    catch (...)
+    {
+      cleanupNoThrow([&] { model_->freeCudaMem(); });
+      cleanupNoThrow([&] { cost_->freeCudaMem(); });
+      cleanupNoThrow([&] { fb_controller_->freeCudaMem(); });
+      cleanupNoThrow([&] { sampler_->freeCudaMem(); });
+      throw;
+    }
 
     auto logger = std::make_shared<mppi::util::MPPILogger>();
     setLogger(logger);
@@ -200,7 +211,18 @@ public:
     HANDLE_ERROR(cudaStreamCreate(&vis_stream_));
     vis_stream_owner_.reset(vis_stream_);
 
-    GPUSetup();
+    try
+    {
+      GPUSetup();
+    }
+    catch (...)
+    {
+      cleanupNoThrow([&] { model_->freeCudaMem(); });
+      cleanupNoThrow([&] { cost_->freeCudaMem(); });
+      cleanupNoThrow([&] { fb_controller_->freeCudaMem(); });
+      cleanupNoThrow([&] { sampler_->freeCudaMem(); });
+      throw;
+    }
 
     auto logger = std::make_shared<mppi::util::MPPILogger>();
     setLogger(logger);
@@ -221,22 +243,27 @@ public:
    */
   virtual ~Controller()
   {
+    // Drain both consumers before releasing dependencies and asynchronous-copy sources.
+    if (gen_owner_)
+      gpuAssert(cudaStreamSynchronize(stream_), __FILE__, __LINE__, false);
+    if (vis_stream_owner_)
+      gpuAssert(cudaStreamSynchronize(vis_stream_), __FILE__, __LINE__, false);
     // Free the CUDA memory of every object
     if (model_)
     {
-      model_->freeCudaMem();
+      cleanupNoThrow([&] { model_->freeCudaMem(); });
     }
     if (cost_)
     {
-      cost_->freeCudaMem();
+      cleanupNoThrow([&] { cost_->freeCudaMem(); });
     }
     if (fb_controller_)
     {
-      fb_controller_->freeCudaMem();
+      cleanupNoThrow([&] { fb_controller_->freeCudaMem(); });
     }
     if (sampler_)
     {
-      sampler_->freeCudaMem();
+      cleanupNoThrow([&] { sampler_->freeCudaMem(); });
     }
 
     // Free the CUDA memory of the controller
@@ -1004,8 +1031,8 @@ protected:
 
   curandGenerator_t gen_ = nullptr;  // Non-owning alias of gen_owner_.
   // float* control_std_dev_d_;  // Array of size DYN_T::CONTROL_DIM
-  float* initial_state_d_;      // Array of sizae DYN_T::STATE_DIM * (2 if there is a nominal state)
-  float* vis_initial_state_d_;  // Array of sizae DYN_T::STATE_DIM * (2 if there is a nominal state)
+  float* initial_state_d_ = nullptr;      // Array of sizae DYN_T::STATE_DIM * (2 if there is a nominal state)
+  float* vis_initial_state_d_ = nullptr;  // Array of sizae DYN_T::STATE_DIM * (2 if there is a nominal state)
 
   Eigen::Matrix<float, DYN_T::CONTROL_DIM, 2> control_history_;
   /** Pre-Savitzky–Golay u[0] from the latest computeControl; used for control_history_ on slide. */
@@ -1014,11 +1041,11 @@ protected:
   // one array of this size is allocated for each state we care about,
   // so it can be the size*N for N nominal states
   // [actual, nominal]
-  float* control_d_;           // Array of size DYN_T::CONTROL_DIM*NUM_TIMESTEPS*N
-  float* output_d_;            // Array of size DYN_T::OUTPUT_DIM*NUM_ROLLOUTS*N
-  float* trajectory_costs_d_;  // Array of size NUM_ROLLOUTS*N
+  float* control_d_ = nullptr;           // Array of size DYN_T::CONTROL_DIM*NUM_TIMESTEPS*N
+  float* output_d_ = nullptr;            // Array of size DYN_T::OUTPUT_DIM*NUM_ROLLOUTS*N
+  float* trajectory_costs_d_ = nullptr;  // Array of size NUM_ROLLOUTS*N
   // float* control_noise_d_;            // Array of size DYN_T::CONTROL_DIM*NUM_TIMESTEPS*NUM_ROLLOUTS*N
-  float2* cost_baseline_and_norm_d_;  // Array of size number of systems
+  float2* cost_baseline_and_norm_d_ = nullptr;  // Array of size number of systems
   control_trajectory control_ = control_trajectory::Zero();
   state_trajectory state_ = state_trajectory::Zero();
   output_trajectory output_ = output_trajectory::Zero();
@@ -1027,10 +1054,10 @@ protected:
   bool CUDA_mem_init_ = false;
 
   bool sampled_states_CUDA_mem_init_ = false;  // cudaMalloc, cudaFree boolean
-  float* sampled_outputs_d_;                   // result of states that have been sampled from state trajectory kernel
-  float* sampled_noise_d_;                     // noise to be passed to the state trajectory kernel
-  float* sampled_costs_d_;       // result of cost that have been sampled from state and cost trajectory kernel
-  int* sampled_crash_status_d_;  // result of crash_status that have been sampled
+  float* sampled_outputs_d_ = nullptr;         // result of states that have been sampled from state trajectory kernel
+  float* sampled_noise_d_ = nullptr;           // noise to be passed to the state trajectory kernel
+  float* sampled_costs_d_ = nullptr;  // result of cost that have been sampled from state and cost trajectory kernel
+  int* sampled_crash_status_d_ = nullptr;                // result of crash_status that have been sampled
   std::vector<output_trajectory> sampled_trajectories_;  // sampled state trajectories from state trajectory kernel
   std::vector<cost_trajectory> sampled_costs_;
   std::vector<crash_status_trajectory> sampled_crash_status_;

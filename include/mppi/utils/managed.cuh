@@ -67,13 +67,16 @@ public:
   }
 
   /**
-  @brief Sets the stream and synchronizes the device.
+  @brief Rebinds a live device object after draining its previous stream; CPU construction is CUDA-free.
   @param stream is the CUDA stream that the object is assigned too.
   */
   void bindToStream(cudaStream_t stream)
   {
+    if (GPUMemStatus_ && stream_ != stream)
+    {
+      HANDLE_ERROR(cudaStreamSynchronize(stream_));
+    }
     stream_ = stream;
-    cudaDeviceSynchronize();
   }
 
   // REQUIRED: basic interface, make sure to implement in each class
@@ -121,11 +124,18 @@ protected:
   static T* GPUSetup(T* host_ptr)
   {
     // Allocate enough space on the GPU for the object
-    T* device_ptr;
-    cudaMalloc((void**)&device_ptr, sizeof(T));
-    // Cudamemcpy
-    HANDLE_ERROR(cudaMemcpyAsync(device_ptr, host_ptr, sizeof(T), cudaMemcpyHostToDevice, host_ptr->stream_));
-    cudaDeviceSynchronize();
+    T* device_ptr = nullptr;
+    HANDLE_ERROR(cudaMalloc((void**)&device_ptr, sizeof(T)));
+    try
+    {
+      HANDLE_ERROR(cudaMemcpyAsync(device_ptr, host_ptr, sizeof(T), cudaMemcpyHostToDevice, host_ptr->stream_));
+      HANDLE_ERROR(cudaStreamSynchronize(host_ptr->stream_));
+    }
+    catch (...)
+    {
+      cudaFreeNoThrow(device_ptr);
+      throw;
+    }
     host_ptr->GPUMemStatus_ = true;
     return device_ptr;
   }

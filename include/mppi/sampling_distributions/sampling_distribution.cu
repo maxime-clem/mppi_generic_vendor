@@ -9,9 +9,17 @@ void SamplingDistribution<CLASS_T, PARAMS_TEMPLATE, DYN_PARAMS_T>::GPUSetup()
   CLASS_T* derived = static_cast<CLASS_T*>(this);
   if (!GPUMemStatus_)
   {
-    sampling_d_ = Managed::GPUSetup<CLASS_T>(derived);
-    allocateCUDAMemory();
-    resizeVisualizationControlTrajectories(true);
+    try
+    {
+      sampling_d_ = Managed::GPUSetup<CLASS_T>(derived);
+      allocateCUDAMemory();
+      resizeVisualizationControlTrajectories(true);
+    }
+    catch (...)
+    {
+      cleanupNoThrow([&] { derived->freeCudaMem(); });
+      throw;
+    }
   }
   else
   {
@@ -25,14 +33,14 @@ __host__ void SamplingDistribution<CLASS_T, PARAMS_TEMPLATE, DYN_PARAMS_T>::free
 {
   if (GPUMemStatus_)
   {
-    HANDLE_ERROR(cudaFree(sampling_d_));
-    HANDLE_ERROR(cudaFree(control_samples_d_));
-    HANDLE_ERROR(cudaFree(vis_control_samples_d_));
-    GPUMemStatus_ = false;
-    sampling_d_ = nullptr;
-    control_samples_d_ = nullptr;
-    vis_control_samples_d_ = nullptr;
+    gpuAssert(cudaStreamSynchronize(stream_), __FILE__, __LINE__, false);
+    if (vis_stream_ != stream_)
+      gpuAssert(cudaStreamSynchronize(vis_stream_), __FILE__, __LINE__, false);
   }
+  cudaFreeNoThrow(sampling_d_);
+  cudaFreeNoThrow(control_samples_d_);
+  cudaFreeNoThrow(vis_control_samples_d_);
+  GPUMemStatus_ = false;
 }
 
 template <class CLASS_T, template <int> class PARAMS_TEMPLATE, class DYN_PARAMS_T>
@@ -98,8 +106,10 @@ __host__ void SamplingDistribution<CLASS_T, PARAMS_TEMPLATE, DYN_PARAMS_T>::allo
     {  // deallocate previous memory for control samples
 #if defined(CUDART_VERSION) && CUDART_VERSION > 11200
       HANDLE_ERROR(cudaFreeAsync(control_samples_d_, stream_));
+      control_samples_d_ = nullptr;
 #else
       HANDLE_ERROR(cudaFree(control_samples_d_));
+      control_samples_d_ = nullptr;
 #endif
       // control_samples_d_ = nullptr;
     }
@@ -134,8 +144,10 @@ SamplingDistribution<CLASS_T, PARAMS_TEMPLATE, DYN_PARAMS_T>::resizeVisualizatio
     {  // deallocate previous memory for control samples
 #if defined(CUDART_VERSION) && CUDART_VERSION > 11200
       HANDLE_ERROR(cudaFreeAsync(vis_control_samples_d_, vis_stream_));
+      vis_control_samples_d_ = nullptr;
 #else
       HANDLE_ERROR(cudaFree(vis_control_samples_d_));
+      vis_control_samples_d_ = nullptr;
 #endif
       // vis_control_samples_d_ = nullptr;
     }

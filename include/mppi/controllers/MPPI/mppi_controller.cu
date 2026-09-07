@@ -21,13 +21,21 @@ VanillaMPPI::VanillaMPPIController(DYN_T* model, COST_T* cost, FB_T* fb_controll
   : PARENT_CLASS(model, cost, fb_controller, sampler, dt, max_iter, lambda, alpha, num_timesteps, init_control_traj,
                  stream)
 {
-  // Allocate CUDA memory for the controller
-  allocateCUDAMemory();
+  try
+  {
+    // Allocate CUDA memory for the controller
+    allocateCUDAMemory();
 
-  // Copy the noise std_dev to the device
-  // this->copyControlStdDevToDevice();
+    // Copy the noise std_dev to the device
+    // this->copyControlStdDevToDevice();
 
-  chooseAppropriateKernel();
+    chooseAppropriateKernel();
+  }
+  catch (...)
+  {
+    releaseWeightBuffers();
+    throw;
+  }
 }
 
 VANILLA_MPPI_TEMPLATE
@@ -35,12 +43,20 @@ VanillaMPPI::VanillaMPPIController(DYN_T* model, COST_T* cost, FB_T* fb_controll
                                    PARAMS_T& params, cudaStream_t stream)
   : PARENT_CLASS(model, cost, fb_controller, sampler, params, stream)
 {
-  // Allocate CUDA memory for the controller
-  allocateCUDAMemory();
+  try
+  {
+    // Allocate CUDA memory for the controller
+    allocateCUDAMemory();
 
-  // // Copy the noise std_dev to the device
-  // this->copyControlStdDevToDevice();
-  chooseAppropriateKernel();
+    // // Copy the noise std_dev to the device
+    // this->copyControlStdDevToDevice();
+    chooseAppropriateKernel();
+  }
+  catch (...)
+  {
+    releaseWeightBuffers();
+    throw;
+  }
 }
 
 VANILLA_MPPI_TEMPLATE
@@ -148,21 +164,22 @@ void VanillaMPPI::chooseAppropriateKernel()
 VANILLA_MPPI_TEMPLATE
 VanillaMPPI::~VanillaMPPIController()
 {
-  if (weight_stats_d_ != nullptr)
-  {
-    HANDLE_ERROR(cudaFree(weight_stats_d_));
-    weight_stats_d_ = nullptr;
-  }
+  releaseWeightBuffers();
+}
+
+VANILLA_MPPI_TEMPLATE
+void VanillaMPPI::releaseWeightBuffers() noexcept
+{
+  if (weight_stats_d_ || weight_stats_h_ || rollout_crash_status_d_)
+    gpuAssert(cudaStreamSynchronize(this->stream_), __FILE__, __LINE__, false);
+  cudaFreeNoThrow(weight_stats_d_);
   if (weight_stats_h_ != nullptr)
   {
-    HANDLE_ERROR(cudaFreeHost(weight_stats_h_));
+    gpuAssert(cudaFreeHost(weight_stats_h_), __FILE__, __LINE__, false);
     weight_stats_h_ = nullptr;
   }
-  if (rollout_crash_status_d_ != nullptr)
-  {
-    HANDLE_ERROR(cudaFree(rollout_crash_status_d_));
-    rollout_crash_status_d_ = nullptr;
-  }
+  cudaFreeNoThrow(rollout_crash_status_d_);
+  weight_stats_capacity_ = 0;
 }
 
 VANILLA_MPPI_TEMPLATE
@@ -409,11 +426,14 @@ void VanillaMPPI::ensureWeightStatsCapacity(int required_capacity)
   if (weight_stats_d_ != nullptr)
   {
     HANDLE_ERROR(cudaFree(weight_stats_d_));
+    weight_stats_d_ = nullptr;
   }
   if (weight_stats_h_ != nullptr)
   {
     HANDLE_ERROR(cudaFreeHost(weight_stats_h_));
+    weight_stats_h_ = nullptr;
   }
+  weight_stats_capacity_ = 0;
   HANDLE_ERROR(
       cudaMalloc((void**)&weight_stats_d_, static_cast<std::size_t>(required_capacity) * sizeof(*weight_stats_d_)));
   HANDLE_ERROR(

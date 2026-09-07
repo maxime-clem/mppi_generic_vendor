@@ -1572,17 +1572,17 @@ void launchSplitRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__
                               dim3 dimCostBlock, cudaStream_t stream, bool synchronize,
                               int* __restrict__ rollout_crash_status_d)
 {
-  if (num_rollouts % dimDynBlock.x != 0)
+  if (dimDynBlock.x == 0 || num_rollouts % dimDynBlock.x != 0)
   {
     std::cerr << __FILE__ << " (" << __LINE__ << "): num_rollouts (" << num_rollouts
               << ") must be evenly divided by dynamics block size x (" << dimDynBlock.x << ")" << std::endl;
-    exit(EXIT_FAILURE);
+    throw std::invalid_argument("Invalid MPPI rollout launch dimensions");
   }
   if (num_timesteps < dimCostBlock.x)
   {
     std::cerr << __FILE__ << " (" << __LINE__ << "): num_timesteps (" << num_timesteps
               << ") must be greater than or equal to cost block size x (" << dimCostBlock.x << ")" << std::endl;
-    exit(EXIT_FAILURE);
+    throw std::invalid_argument("Invalid MPPI rollout launch dimensions");
   }
   // Run Dynamics
   const int gridsize_x = math::int_ceil(num_rollouts, dimDynBlock.x);
@@ -1613,11 +1613,11 @@ void launchRolloutKernel(DYN_T* __restrict__ dynamics, COST_T* __restrict__ cost
                          cudaStream_t stream, bool synchronize,
                          int* __restrict__ rollout_crash_status_d)
 {
-  if (num_rollouts % dimBlock.x != 0)
+  if (dimBlock.x == 0 || num_rollouts % dimBlock.x != 0)
   {
     std::cerr << __FILE__ << " (" << __LINE__ << "): num_rollouts (" << num_rollouts
               << ") must be evenly divided by rollout thread block size x (" << dimBlock.x << ")" << std::endl;
-    exit(EXIT_FAILURE);
+    throw std::invalid_argument("Invalid MPPI rollout launch dimensions");
   }
 
   const int gridsize_x = math::int_ceil(num_rollouts, dimBlock.x);

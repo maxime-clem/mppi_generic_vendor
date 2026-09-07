@@ -13,12 +13,8 @@ void Cost<CLASS_T, PARAMS_T, DYN_PARAMS_T>::paramsToDevice()
 template <class CLASS_T, class PARAMS_T, class DYN_PARAMS_T>
 void Cost<CLASS_T, PARAMS_T, DYN_PARAMS_T>::freeCudaMem()
 {
-  if (GPUMemStatus_)
-  {
-    cudaFree(cost_d_);
-    GPUMemStatus_ = false;
-    cost_d_ = nullptr;
-  }
+  cudaFreeNoThrow(cost_d_);
+  GPUMemStatus_ = false;
 }
 
 template <class CLASS_T, class PARAMS_T, class DYN_PARAMS_T>

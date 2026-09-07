@@ -200,17 +200,16 @@ COLORED_TEMPLATE
 __host__ void COLORED_NOISE::freeCudaMem()
 {
   if (this->GPUMemStatus_)
+    gpuAssert(cudaStreamSynchronize(this->stream_), __FILE__, __LINE__, false);
+  if (plan_ != 0)
   {
-    cudaFree(freq_coeffs_d_);
-    cudaFree(samples_in_freq_complex_d_);
-    cudaFree(noise_in_time_d_);
-    cudaFree(frequency_sigma_d_);
-    freq_coeffs_d_ = nullptr;
-    frequency_sigma_d_ = nullptr;
-    noise_in_time_d_ = nullptr;
-    samples_in_freq_complex_d_ = nullptr;
-    cufftDestroy(plan_);
+    cufftAssert(cufftDestroy(plan_), __FILE__, __LINE__, false);
+    plan_ = 0;
   }
+  cudaFreeNoThrow(freq_coeffs_d_);
+  cudaFreeNoThrow(samples_in_freq_complex_d_);
+  cudaFreeNoThrow(noise_in_time_d_);
+  cudaFreeNoThrow(frequency_sigma_d_);
   PARENT_CLASS::freeCudaMem();
 }
 
@@ -226,18 +225,22 @@ __host__ void COLORED_NOISE::allocateCUDAMemoryHelper()
     if (frequency_sigma_d_)
     {
       HANDLE_ERROR(cudaFreeAsync(frequency_sigma_d_, this->stream_));
+      frequency_sigma_d_ = nullptr;
     }
     if (samples_in_freq_complex_d_)
     {
       HANDLE_ERROR(cudaFreeAsync(samples_in_freq_complex_d_, this->stream_));
+      samples_in_freq_complex_d_ = nullptr;
     }
     if (noise_in_time_d_)
     {
       HANDLE_ERROR(cudaFreeAsync(noise_in_time_d_, this->stream_));
+      noise_in_time_d_ = nullptr;
     }
     if (freq_coeffs_d_)
     {
       HANDLE_ERROR(cudaFreeAsync(freq_coeffs_d_, this->stream_));
+      freq_coeffs_d_ = nullptr;
     }
     HANDLE_ERROR(
         cudaMallocAsync((void**)&freq_coeffs_d_, sizeof(float) * freq_size * this->CONTROL_DIM, this->stream_));
@@ -254,18 +257,22 @@ __host__ void COLORED_NOISE::allocateCUDAMemoryHelper()
     if (frequency_sigma_d_)
     {
       HANDLE_ERROR(cudaFree(frequency_sigma_d_));
+      frequency_sigma_d_ = nullptr;
     }
     if (samples_in_freq_complex_d_)
     {
       HANDLE_ERROR(cudaFree(samples_in_freq_complex_d_));
+      samples_in_freq_complex_d_ = nullptr;
     }
     if (noise_in_time_d_)
     {
       HANDLE_ERROR(cudaFree(noise_in_time_d_));
+      noise_in_time_d_ = nullptr;
     }
     if (freq_coeffs_d_)
     {
       HANDLE_ERROR(cudaFree(freq_coeffs_d_));
+      freq_coeffs_d_ = nullptr;
     }
     HANDLE_ERROR(cudaMalloc((void**)&freq_coeffs_d_, sizeof(float) * freq_size * this->CONTROL_DIM));
     HANDLE_ERROR(cudaMalloc((void**)&frequency_sigma_d_, sizeof(float) * this->CONTROL_DIM));
@@ -275,7 +282,13 @@ __host__ void COLORED_NOISE::allocateCUDAMemoryHelper()
     HANDLE_ERROR(cudaMalloc((void**)&noise_in_time_d_, sizeof(float) * this->getNumRollouts() * this->CONTROL_DIM *
                                                            sample_num_timesteps * this->getNumDistributions()));
 #endif
-    // Recreate FFT Plan
+    // Destroy the previous plan before replacement, including dimension-change reallocation.
+    if (plan_ != 0)
+    {
+      const cufftHandle previous_plan = plan_;
+      plan_ = 0;
+      HANDLE_CUFFT_ERROR(cufftDestroy(previous_plan));
+    }
     HANDLE_CUFFT_ERROR(cufftPlan1d(&plan_, sample_num_timesteps, CUFFT_C2R,
                                    this->getNumRollouts() * this->getNumDistributions() * this->CONTROL_DIM));
     HANDLE_CUFFT_ERROR(cufftSetStream(plan_, this->stream_));

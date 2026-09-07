@@ -121,7 +121,7 @@ public:
 protected:
   __host__ void updateFrequencyScaling();
 
-  cufftHandle plan_;
+  cufftHandle plan_ = 0;
   Eigen::MatrixXf frequency_coeffs_h_;
   std::vector<float> frequency_sigma_h_;
   float* frequency_sigma_d_ = nullptr;

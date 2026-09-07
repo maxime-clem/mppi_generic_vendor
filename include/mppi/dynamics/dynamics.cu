@@ -82,12 +82,8 @@ void Dynamics<CLASS_T, PARAMS_T>::GPUSetup()
 template <class CLASS_T, class PARAMS_T>
 void Dynamics<CLASS_T, PARAMS_T>::freeCudaMem()
 {
-  if (GPUMemStatus_)
-  {
-    HANDLE_ERROR(cudaFree(model_d_));
-    GPUMemStatus_ = false;
-    model_d_ = nullptr;
-  }
+  cudaFreeNoThrow(model_d_);
+  GPUMemStatus_ = false;
 }
 
 template <class CLASS_T, class PARAMS_T>

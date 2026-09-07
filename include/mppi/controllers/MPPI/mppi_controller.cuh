@@ -146,6 +146,7 @@ protected:
 private:
   // ======== MUST BE OVERWRITTEN =========
   void allocateCUDAMemory();
+  void releaseWeightBuffers() noexcept;
   // ======== END MUST BE OVERWRITTEN =====
 
   void ensureWeightStatsCapacity(int required_capacity);

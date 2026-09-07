@@ -21,8 +21,8 @@ void GPUFeedbackController<CLASS_T, DYN_T, FEEDBACK_STATE_T>::freeCudaMem()
   if (GPUMemStatus_)
   {
     CLASS_T* derived = static_cast<CLASS_T*>(this);
-    derived->deallocateCUDAMemory();
-    cudaFree(feedback_d_);
+    cleanupNoThrow([&] { derived->deallocateCUDAMemory(); });
+    cudaFreeNoThrow(feedback_d_);
     GPUMemStatus_ = false;
     feedback_d_ = nullptr;
   }

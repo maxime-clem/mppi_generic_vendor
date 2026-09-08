@@ -1,5 +1,6 @@
 #include <atomic>
 #include <mppi/controllers/MPPI/mppi_controller.cuh>
+#include <mppi/controllers/MPPI/ess_lambda_adaptation.h>
 #include <mppi/core/mppi_common.cuh>
 #include <mppi/utils/nvtx.cuh>
 #include <algorithm>
@@ -170,7 +171,7 @@ VanillaMPPI::~VanillaMPPIController()
 VANILLA_MPPI_TEMPLATE
 void VanillaMPPI::releaseWeightBuffers() noexcept
 {
-  if (weight_stats_d_ || weight_stats_h_ || rollout_crash_status_d_)
+  if (weight_stats_d_ || weight_stats_h_ || rollout_crash_status_d_ || raw_rollout_costs_d_)
     gpuAssert(cudaStreamSynchronize(this->stream_), __FILE__, __LINE__, false);
   cudaFreeNoThrow(weight_stats_d_);
   if (weight_stats_h_ != nullptr)
@@ -179,6 +180,8 @@ void VanillaMPPI::releaseWeightBuffers() noexcept
     weight_stats_h_ = nullptr;
   }
   cudaFreeNoThrow(rollout_crash_status_d_);
+  cudaFreeNoThrow(raw_rollout_costs_d_);
+  raw_rollout_costs_valid_ = false;
   weight_stats_capacity_ = 0;
 }
 
@@ -187,6 +190,14 @@ void VanillaMPPI::configureEssLambdaAdaptation(float target_ess_ratio, float ada
                                                float lambda_max, float unsafe_rollout_fraction_threshold,
                                                float cost_normalization_percentile)
 {
+  if (!std::isfinite(target_ess_ratio) || target_ess_ratio < 0.0F || target_ess_ratio > 1.0F ||
+      !std::isfinite(adaptation_gain) || adaptation_gain < 0.0F || !std::isfinite(lambda_min) || lambda_min < 1.0E-6F ||
+      !std::isfinite(lambda_max) || lambda_max < lambda_min || !std::isfinite(this->getLambda()) ||
+      this->getLambda() < lambda_min || this->getLambda() > lambda_max ||
+      !std::isfinite(unsafe_rollout_fraction_threshold) || unsafe_rollout_fraction_threshold < 0.0F ||
+      unsafe_rollout_fraction_threshold > 1.0F || !std::isfinite(cost_normalization_percentile) ||
+      cost_normalization_percentile < 0.0F || cost_normalization_percentile > 1.0F)
+    throw std::invalid_argument("Invalid MPPI ESS adaptation parameters or initial lambda");
   target_ess_ratio_ = std::max(0.0F, std::min(1.0F, target_ess_ratio));
   lambda_adaptation_gain_ = std::max(0.0F, adaptation_gain);
   lambda_min_ = std::max(1.0E-6F, lambda_min);
@@ -208,8 +219,22 @@ void VanillaMPPI::downloadImportanceWeightsToHost()
 }
 
 VANILLA_MPPI_TEMPLATE
+std::vector<float> VanillaMPPI::downloadRawRolloutCostsToHost()
+{
+  if (!raw_rollout_costs_valid_)
+    return {};
+  std::vector<float> costs(NUM_ROLLOUTS);
+  HANDLE_ERROR(cudaMemcpyAsync(costs.data(), raw_rollout_costs_d_, NUM_ROLLOUTS * sizeof(float), cudaMemcpyDeviceToHost,
+                               this->stream_));
+  HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
+  return costs;
+}
+
+VANILLA_MPPI_TEMPLATE
 void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int optimization_stride)
 {
+  const control_trajectory initial_control = this->control_;
+  raw_rollout_costs_valid_ = false;
   this->free_energy_statistics_.real_sys.previousBaseline = this->getBaselineCost();
 
   const int num_iterations = std::max(0, this->getNumIters());
@@ -284,6 +309,13 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
       optimizationIterationComplete(opt_iter);
     }
 
+    if (opt_iter == num_iterations - 1)
+    {
+      // Preserve exact raw values before clipping/masking destroys information. Download only
+      // when a diagnostic consumer requests them; the normal path adds one small D2D copy.
+      HANDLE_ERROR(cudaMemcpyAsync(raw_rollout_costs_d_, this->trajectory_costs_d_, NUM_ROLLOUTS * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, this->stream_));
+    }
     // One device kernel computes robust-normalized exponential weights, the weight normalizer,
     // ESS, and safety statistics. The per-iteration records remain on-device until the loop ends.
     {
@@ -321,6 +353,21 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
     this->sampler_->setHostOptimalControlSequence(this->control_.data(), 0, true);
     device_optimal_control_ = this->control_;
     last_weight_stats_index_ = num_iterations - 1;
+    for (int iteration = 0; iteration < num_iterations; ++iteration)
+    {
+      if (weight_stats_h_[iteration].eligible_count == 0 || !std::isfinite(weight_stats_h_[iteration].normalizer) ||
+          weight_stats_h_[iteration].normalizer <= 0.0F)
+      {
+        this->control_ = initial_control;
+        device_optimal_control_ = initial_control;
+        computeStateTrajectory(state);  // Diagnostic/validation replay of the preserved seed only.
+        raw_rollout_costs_valid_ = true;
+        // No candidate may be applied after a failed iteration, even if later sampling recovered.
+        // The caller's exception/fallback path decides what can safely be published.
+        throw NoEligibleRollouts();
+      }
+    }
+    raw_rollout_costs_valid_ = true;
   }
   else
   {
@@ -348,8 +395,9 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
     this->free_energy_statistics_.real_sys.freeEnergyMean =
         -last_iteration_weight_lambda_ * std::log(std::max(mean_weight, 1.0E-12F));
 
-    const float mean_raw_cost = weight_stats.raw_cost_sum / rollout_count;
-    const float mean_squared_raw_cost = weight_stats.raw_cost_squared_sum / rollout_count;
+    const float finite_count = std::max(1.0F, static_cast<float>(weight_stats.finite_count));
+    const float mean_raw_cost = weight_stats.raw_cost_sum / finite_count;
+    const float mean_squared_raw_cost = weight_stats.raw_cost_squared_sum / finite_count;
     this->free_energy_statistics_.real_sys.freeEnergyVariance =
         std::max(0.0F, mean_squared_raw_cost - mean_raw_cost * mean_raw_cost);
     const float variance_scale = this->free_energy_statistics_.real_sys.freeEnergyVariance /
@@ -362,18 +410,9 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
     // control cycle uses the same temperature.
     if (lambda_adaptation_enabled_ && opt_iter == num_iterations - 1 && !iteration_effective_sample_sizes_.empty())
     {
-      if (weight_stats.unsafe_rollout_fraction >= unsafe_rollout_fraction_threshold_)
-      {
-        // Panic melt only when the rollout population itself reports unavoidable safety contact.
-        last_weight_lambda_ = lambda_max_;
-      }
-      else
-      {
-        const float ess_ratio = iteration_effective_sample_sizes_.back() / rollout_count;
-        const float error = target_ess_ratio_ - ess_ratio;
-        const float lambda_multiplier = std::exp(lambda_adaptation_gain_ * error);
-        last_weight_lambda_ = std::max(lambda_min_, std::min(lambda_max_, last_weight_lambda_ * lambda_multiplier));
-      }
+      last_weight_lambda_ =
+          mppi::controllers::adaptEssLambda(last_iteration_weight_lambda_, weight_stats, target_ess_ratio_,
+                                            lambda_adaptation_gain_, lambda_min_, lambda_max_);
     }
   }
 
@@ -413,6 +452,7 @@ void VanillaMPPI::allocateCUDAMemory()
   PARENT_CLASS::allocateCUDAMemoryHelper();
   ensureWeightStatsCapacity(std::max(1, this->getNumIters()));
   HANDLE_ERROR(cudaMalloc((void**)&rollout_crash_status_d_, NUM_ROLLOUTS * sizeof(int)));
+  HANDLE_ERROR(cudaMalloc((void**)&raw_rollout_costs_d_, NUM_ROLLOUTS * sizeof(float)));
 }
 
 VANILLA_MPPI_TEMPLATE

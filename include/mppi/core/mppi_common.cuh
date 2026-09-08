@@ -14,11 +14,12 @@ namespace kernels
 /** Scalar statistics produced by the fused rollout cost-normalization/weight kernel. */
 struct CostWeightStats
 {
-  /** Minimum and maximum finite raw rollout costs. */
+  /** Minimum eligible cost, or FLT_MAX when no finite, safe rollout exists. */
   float rollout_min_cost = 0.0F;
+  /** Minimum and maximum finite raw rollout costs, including unsafe samples. */
   float min_cost = 0.0F;
   float max_cost = 0.0F;
-  /** Robust upper cost used as the normalization scale (normally the 95th percentile). */
+  /** Exact upper percentile of finite, safe rollout costs used as the normalization scale. */
   float normalization_upper_cost = 0.0F;
   /** Sum of exponential weights before they are normalized in-place. */
   float normalizer = 0.0F;
@@ -29,6 +30,10 @@ struct CostWeightStats
   float raw_cost_squared_sum = 0.0F;
   /** Fraction of rollouts whose cost function reported a collision/safety violation. */
   float unsafe_rollout_fraction = 0.0F;
+  int finite_count = 0;
+  int eligible_count = 0;
+  /** Number of eligible rollouts with normalized cost zero: the attainable ESS floor. */
+  int minimum_cost_count = 0;
 };
 
 /*******************************************************************************************************************
@@ -220,7 +225,7 @@ __device__ void setInitialControlToZero(int control_dim, int thread_idx, float* 
  *
  * @return
  */
-__device__ void strideControlWeightReduction(const int num_rollouts, const int num_timesteps, const int sum_stride,
+__device__ bool strideControlWeightReduction(const int num_rollouts, const int num_timesteps, const int sum_stride,
                                              const int thread_idx, const int block_idx, const int control_dim,
                                              const float* __restrict__ exp_costs_d, const float normalizer,
                                              const float* __restrict__ du_d, float* __restrict__ u,

@@ -765,10 +765,12 @@ __global__ void weightedReductionKernel(const float* __restrict__ exp_costs_d, c
   __syncthreads();
 
   // Sum the weighted control variations at a desired stride
-  strideControlWeightReduction(num_rollouts, num_timesteps, sum_stride, thread_idx, block_idx, CONTROL_DIM, exp_costs_d,
-                               normalizer, du_d, u, u_intermediate);
+  const bool has_weight = strideControlWeightReduction(num_rollouts, num_timesteps, sum_stride, thread_idx, block_idx,
+                                                       CONTROL_DIM, exp_costs_d, normalizer, du_d, u, u_intermediate);
 
-  __syncthreads();
+  // Uniform block decision; preserve the existing mean when no valid sample contributes.
+  if (__syncthreads_count(has_weight) == 0)
+    return;
 
   // Sum all weighted control variations
   rolloutWeightReductionAndSaveControl(thread_idx, block_idx, num_rollouts, num_timesteps, CONTROL_DIM, sum_stride, u,
@@ -793,10 +795,12 @@ __global__ void weightedReductionKernel(float* exp_costs_d, float* du_d, float* 
   __syncthreads();
 
   // Sum the weighted control variations at a desired stride
-  strideControlWeightReduction(NUM_ROLLOUTS, num_timesteps, SUM_STRIDE, thread_idx, block_idx, CONTROL_DIM, exp_costs_d,
-                               baseline_and_normalizer_d->y, du_d, u, u_intermediate);
+  const bool has_weight =
+      strideControlWeightReduction(NUM_ROLLOUTS, num_timesteps, SUM_STRIDE, thread_idx, block_idx, CONTROL_DIM,
+                                   exp_costs_d, baseline_and_normalizer_d->y, du_d, u, u_intermediate);
 
-  __syncthreads();
+  if (__syncthreads_count(has_weight) == 0)
+    return;
 
   // Sum all weighted control variations
   rolloutWeightReductionAndSaveControl(thread_idx, block_idx, NUM_ROLLOUTS, num_timesteps, CONTROL_DIM, SUM_STRIDE, u,
@@ -1032,9 +1036,9 @@ __device__ __host__ inline void normExpTransform(int num_rollouts, float* __rest
 }
 
 /**
- * Fused raw-cost reduction, robust-percentile normalization, exponential transform, safety count,
- * and first/second weight-moment reduction. A single block loops over the rollout array so all
- * results remain block-local and the output weights can be consumed directly by the sampler.
+ * Normalize finite, safe costs using an exact nearest-rank percentile. Four radix passes select
+ * an actual float value, so arbitrarily large finite outliers cannot set the histogram resolution.
+ * Unsafe/nonfinite samples always receive zero weight; an empty eligible set remains all-zero.
  */
 __global__ void minMaxWeightKernel(int num_rollouts, float* __restrict__ trajectory_costs_d,
                                    const int* __restrict__ rollout_crash_status_d, float lambda_inv,
@@ -1044,171 +1048,154 @@ __global__ void minMaxWeightKernel(int num_rollouts, float* __restrict__ traject
   extern __shared__ float reduction[];
   float* min_values = reduction;
   float* max_values = min_values + blockDim.x;
-  float* raw_cost_sums = max_values + blockDim.x;
+  float* raw_min_values = max_values + blockDim.x;
+  float* raw_max_values = raw_min_values + blockDim.x;
+  float* raw_cost_sums = raw_max_values + blockDim.x;
   float* raw_cost_squared_sums = raw_cost_sums + blockDim.x;
-  int* finite_counts = reinterpret_cast<int*>(raw_cost_squared_sums + blockDim.x);
+  int* eligible_counts = reinterpret_cast<int*>(raw_cost_squared_sums + blockDim.x);
+  int* finite_counts = eligible_counts + blockDim.x;
   __shared__ unsigned int unsafe_rollout_count;
-  __shared__ float quantile_lower;
-  __shared__ float quantile_upper;
+  __shared__ unsigned int histogram[256];
+  __shared__ unsigned int quantile_key;
   __shared__ int quantile_rank;
 
   if (threadIdx.x == 0)
-  {
     unsafe_rollout_count = 0U;
-  }
   __syncthreads();
-
   float local_min = FLT_MAX;
   float local_max = -FLT_MAX;
-  float local_raw_cost_sum = 0.0F;
-  float local_raw_cost_squared_sum = 0.0F;
-  int local_finite_count = 0;
-  unsigned int local_unsafe_count = 0U;
+  float local_raw_min = FLT_MAX;
+  float local_raw_max = -FLT_MAX;
+  float local_sum = 0.0F;
+  float local_squared_sum = 0.0F;
+  int local_eligible = 0;
+  int local_finite = 0;
+  unsigned int local_unsafe = 0U;
   for (int rollout = threadIdx.x; rollout < num_rollouts; rollout += blockDim.x)
   {
     const float cost = trajectory_costs_d[rollout];
-    if (isfinite(cost))
+    const bool unsafe = rollout_crash_status_d != nullptr && rollout_crash_status_d[rollout] != 0;
+    local_unsafe += unsafe ? 1U : 0U;
+    if (!isfinite(cost))
+      continue;
+    local_raw_min = fminf(local_raw_min, cost);
+    local_raw_max = fmaxf(local_raw_max, cost);
+    local_sum += cost;
+    local_squared_sum = fmaf(cost, cost, local_squared_sum);
+    ++local_finite;
+    if (!unsafe)
     {
       local_min = fminf(local_min, cost);
       local_max = fmaxf(local_max, cost);
-      local_raw_cost_sum += cost;
-      local_raw_cost_squared_sum = fmaf(cost, cost, local_raw_cost_squared_sum);
-      ++local_finite_count;
-    }
-    if (rollout_crash_status_d != nullptr && rollout_crash_status_d[rollout] != 0)
-    {
-      ++local_unsafe_count;
+      ++local_eligible;
     }
   }
   min_values[threadIdx.x] = local_min;
   max_values[threadIdx.x] = local_max;
-  raw_cost_sums[threadIdx.x] = local_raw_cost_sum;
-  raw_cost_squared_sums[threadIdx.x] = local_raw_cost_squared_sum;
-  finite_counts[threadIdx.x] = local_finite_count;
-  if (local_unsafe_count != 0U)
-  {
-    atomicAdd(&unsafe_rollout_count, local_unsafe_count);
-  }
+  raw_min_values[threadIdx.x] = local_raw_min;
+  raw_max_values[threadIdx.x] = local_raw_max;
+  raw_cost_sums[threadIdx.x] = local_sum;
+  raw_cost_squared_sums[threadIdx.x] = local_squared_sum;
+  eligible_counts[threadIdx.x] = local_eligible;
+  finite_counts[threadIdx.x] = local_finite;
+  if (local_unsafe != 0U)
+    atomicAdd(&unsafe_rollout_count, local_unsafe);
   __syncthreads();
-
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
   {
     if (threadIdx.x < stride)
     {
       min_values[threadIdx.x] = fminf(min_values[threadIdx.x], min_values[threadIdx.x + stride]);
       max_values[threadIdx.x] = fmaxf(max_values[threadIdx.x], max_values[threadIdx.x + stride]);
+      raw_min_values[threadIdx.x] = fminf(raw_min_values[threadIdx.x], raw_min_values[threadIdx.x + stride]);
+      raw_max_values[threadIdx.x] = fmaxf(raw_max_values[threadIdx.x], raw_max_values[threadIdx.x + stride]);
       raw_cost_sums[threadIdx.x] += raw_cost_sums[threadIdx.x + stride];
       raw_cost_squared_sums[threadIdx.x] += raw_cost_squared_sums[threadIdx.x + stride];
+      eligible_counts[threadIdx.x] += eligible_counts[threadIdx.x + stride];
       finite_counts[threadIdx.x] += finite_counts[threadIdx.x + stride];
     }
     __syncthreads();
   }
-
-  const bool has_finite_cost = finite_counts[0] > 0;
-  const float min_cost = has_finite_cost ? min_values[0] : 0.0F;
-  const float max_cost = has_finite_cost ? max_values[0] : min_cost;
+  const int eligible_count = eligible_counts[0];
+  const int finite_count = finite_counts[0];
+  const float min_cost = eligible_count > 0 ? min_values[0] : 0.0F;
+  const float max_cost = eligible_count > 0 ? max_values[0] : 0.0F;
+  const float raw_min_cost = finite_count > 0 ? raw_min_values[0] : 0.0F;
+  const float raw_max_cost = finite_count > 0 ? raw_max_values[0] : 0.0F;
   const float raw_cost_sum = raw_cost_sums[0];
   const float raw_cost_squared_sum = raw_cost_squared_sums[0];
-  const int finite_count = finite_counts[0];
 
-  // Approximate the requested quantile with three successively refined shared-memory histograms.
-  // Unlike a single histogram over [min,max], refinement remains useful when a few collision costs
-  // are orders of magnitude larger than the normal rollout population.
-  constexpr int kQuantileRefinementPasses = 3;
-  unsigned int* quantile_histogram = reinterpret_cast<unsigned int*>(min_values);
   if (threadIdx.x == 0)
   {
-    const float bounded_percentile = fmaxf(0.0F, fminf(1.0F, normalization_percentile));
-    quantile_lower = min_cost;
-    quantile_upper = max_cost;
-    quantile_rank = finite_count > 0
-                        ? max(0, min(finite_count - 1,
-                                     static_cast<int>(ceilf(bounded_percentile * finite_count)) - 1))
-                        : 0;
+    quantile_key = 0U;
+    const float percentile = fmaxf(0.0F, fminf(1.0F, normalization_percentile));
+    quantile_rank = max(0, min(eligible_count - 1, static_cast<int>(ceilf(percentile * eligible_count)) - 1));
   }
   __syncthreads();
-
-  for (int pass = 0; pass < kQuantileRefinementPasses; ++pass)
+  unsigned int prefix_mask = 0U;
+  if (eligible_count > 0 && min_cost != max_cost)
   {
-    const float lower = quantile_lower;
-    const float upper = quantile_upper;
-    const float interval = upper - lower;
-    if (!has_finite_cost || !isfinite(interval) || interval < range_epsilon)
+    for (int shift = 24; shift >= 0; shift -= 8)
     {
-      break;
-    }
-
-    quantile_histogram[threadIdx.x] = 0U;
-    __syncthreads();
-    for (int rollout = threadIdx.x; rollout < num_rollouts; rollout += blockDim.x)
-    {
-      const float cost = trajectory_costs_d[rollout];
-      if (isfinite(cost) && cost >= lower && cost <= upper)
+      for (int bin = threadIdx.x; bin < 256; bin += blockDim.x)
+        histogram[bin] = 0U;
+      __syncthreads();
+      for (int rollout = threadIdx.x; rollout < num_rollouts; rollout += blockDim.x)
       {
-        const float position = (cost - lower) / interval;
-        const int bin = max(0, min(static_cast<int>(blockDim.x) - 1,
-                                   static_cast<int>(position * blockDim.x)));
-        atomicAdd(&quantile_histogram[bin], 1U);
+        const float cost = trajectory_costs_d[rollout];
+        if (!isfinite(cost) || (rollout_crash_status_d != nullptr && rollout_crash_status_d[rollout] != 0))
+          continue;
+        // Ordered IEEE-754 keys support negative costs and collapse signed zeros to one value.
+        const unsigned int bits = __float_as_uint(cost == 0.0F ? 0.0F : cost);
+        const unsigned int key = (bits & 0x80000000U) != 0U ? ~bits : bits ^ 0x80000000U;
+        if ((key & prefix_mask) == quantile_key)
+          atomicAdd(&histogram[(key >> shift) & 255U], 1U);
       }
-    }
-    __syncthreads();
-
-    if (threadIdx.x == 0)
-    {
-      unsigned int cumulative = 0U;
-      int selected_bin = static_cast<int>(blockDim.x) - 1;
-      for (int bin = 0; bin < static_cast<int>(blockDim.x); ++bin)
+      __syncthreads();
+      if (threadIdx.x == 0)
       {
-        const unsigned int next = cumulative + quantile_histogram[bin];
-        if (quantile_rank < static_cast<int>(next))
+        for (int bin = 0; bin < 256; ++bin)
         {
-          selected_bin = bin;
-          break;
+          if (quantile_rank < static_cast<int>(histogram[bin]))
+          {
+            quantile_key |= static_cast<unsigned int>(bin) << shift;
+            break;
+          }
+          quantile_rank -= static_cast<int>(histogram[bin]);
         }
-        cumulative = next;
       }
-      quantile_rank = max(0, quantile_rank - static_cast<int>(cumulative));
-      const float bin_width = interval / static_cast<float>(blockDim.x);
-      quantile_lower = lower + static_cast<float>(selected_bin) * bin_width;
-      quantile_upper = selected_bin == static_cast<int>(blockDim.x) - 1
-                           ? upper
-                           : lower + static_cast<float>(selected_bin + 1) * bin_width;
+      __syncthreads();
+      prefix_mask |= 255U << shift;
     }
-    __syncthreads();
   }
-
-  const float normalization_upper_cost =
-      has_finite_cost ? fmaxf(min_cost, fminf(max_cost, quantile_upper)) : min_cost;
-  const float robust_cost_range = normalization_upper_cost - min_cost;
-  const bool normalize_costs =
-      isfinite(robust_cost_range) && robust_cost_range >= range_epsilon;
-
-  // The min/max reductions are complete, so reuse their shared buffers for the two weight
-  // moments instead of increasing the kernel's shared-memory footprint further.
+  const unsigned int quantile_bits = (quantile_key & 0x80000000U) != 0U ? quantile_key ^ 0x80000000U : ~quantile_key;
+  const float upper_cost = eligible_count > 0 && min_cost != max_cost ? __uint_as_float(quantile_bits) : min_cost;
+  const float cost_range = upper_cost - min_cost;
   float* weight_sums = min_values;
   float* squared_weight_sums = max_values;
   float local_weight_sum = 0.0F;
   float local_squared_weight_sum = 0.0F;
+  int local_minimum_count = 0;
   for (int rollout = threadIdx.x; rollout < num_rollouts; rollout += blockDim.x)
   {
-    const float raw_cost = trajectory_costs_d[rollout];
-    float normalized_cost = 0.0F;
-    if (!isfinite(raw_cost))
+    const float cost = trajectory_costs_d[rollout];
+    if (!isfinite(cost) || (rollout_crash_status_d != nullptr && rollout_crash_status_d[rollout] != 0))
     {
-      // Invalid rollouts never contribute, including when every rollout is invalid.
       trajectory_costs_d[rollout] = 0.0F;
       continue;
     }
-    if (normalize_costs)
+    float normalized_cost = cost > upper_cost ? 1.0F : 0.0F;
+    if (cost_range >= range_epsilon)
     {
-      normalized_cost = (raw_cost - min_cost) / robust_cost_range;
+      // Use FP32 normally; promote overflowing finite-float differences only on the rare path.
+      const float difference = cost - min_cost;
+      normalized_cost =
+          isfinite(cost_range) && isfinite(difference) ?
+              difference / cost_range :
+              static_cast<float>((static_cast<double>(cost) - min_cost) / (static_cast<double>(upper_cost) - min_cost));
       normalized_cost = fmaxf(0.0F, fminf(1.0F, normalized_cost));
     }
-    else if (raw_cost > normalization_upper_cost)
-    {
-      // Preserve rejection of the upper tail when the retained percentile itself is degenerate.
-      normalized_cost = 1.0F;
-    }
+    local_minimum_count += normalized_cost == 0.0F ? 1 : 0;
     const float weight = expf(-lambda_inv * normalized_cost);
     trajectory_costs_d[rollout] = weight;
     local_weight_sum += weight;
@@ -1216,47 +1203,41 @@ __global__ void minMaxWeightKernel(int num_rollouts, float* __restrict__ traject
   }
   weight_sums[threadIdx.x] = local_weight_sum;
   squared_weight_sums[threadIdx.x] = local_squared_weight_sum;
+  eligible_counts[threadIdx.x] = local_minimum_count;
   __syncthreads();
-
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
   {
     if (threadIdx.x < stride)
     {
       weight_sums[threadIdx.x] += weight_sums[threadIdx.x + stride];
       squared_weight_sums[threadIdx.x] += squared_weight_sums[threadIdx.x + stride];
+      eligible_counts[threadIdx.x] += eligible_counts[threadIdx.x + stride];
     }
     __syncthreads();
   }
-
   const float weight_sum = weight_sums[0];
-  const float inverse_weight_sum = weight_sum > 1.0E-12F ? 1.0F / weight_sum : 0.0F;
+  const float inverse_sum = weight_sum > 0.0F ? 1.0F / weight_sum : 0.0F;
   for (int rollout = threadIdx.x; rollout < num_rollouts; rollout += blockDim.x)
-  {
-    trajectory_costs_d[rollout] *= inverse_weight_sum;
-  }
-
+    trajectory_costs_d[rollout] *= inverse_sum;
   if (threadIdx.x == 0)
   {
-    const float squared_weight_sum = squared_weight_sums[0];
-    float effective_sample_size = 0.0F;
-    if (squared_weight_sum > 1.0E-12F)
-    {
-      effective_sample_size = weight_sum * weight_sum / squared_weight_sum;
-    }
-    stats_d->rollout_min_cost = has_finite_cost ? min_cost : FLT_MAX;
-    stats_d->min_cost = min_cost;
-    stats_d->max_cost = max_cost;
-    stats_d->normalization_upper_cost = normalization_upper_cost;
+    stats_d->rollout_min_cost = eligible_count > 0 ? min_cost : FLT_MAX;
+    stats_d->min_cost = raw_min_cost;
+    stats_d->max_cost = raw_max_cost;
+    stats_d->normalization_upper_cost = upper_cost;
     stats_d->normalizer = weight_sum;
-    stats_d->squared_weight_sum = squared_weight_sum;
+    stats_d->squared_weight_sum = squared_weight_sums[0];
     stats_d->effective_sample_size =
-        fmaxf(0.0F, fminf(static_cast<float>(num_rollouts), effective_sample_size));
+        squared_weight_sums[0] > 0.0F ?
+            fminf(static_cast<float>(eligible_count), weight_sum * weight_sum / squared_weight_sums[0]) :
+            0.0F;
     stats_d->raw_cost_sum = raw_cost_sum;
     stats_d->raw_cost_squared_sum = raw_cost_squared_sum;
-    stats_d->unsafe_rollout_fraction = num_rollouts > 0
-                                          ? static_cast<float>(unsafe_rollout_count) /
-                                                static_cast<float>(num_rollouts)
-                                          : 0.0F;
+    stats_d->unsafe_rollout_fraction =
+        num_rollouts > 0 ? static_cast<float>(unsafe_rollout_count) / num_rollouts : 0.0F;
+    stats_d->finite_count = finite_count;
+    stats_d->eligible_count = eligible_count;
+    stats_d->minimum_cost_count = eligible_counts[0];
   }
 }
 
@@ -1407,13 +1388,13 @@ __device__ void setInitialControlToZero(int control_dim, int thread_idx, float* 
   }
 }
 
-__device__ void strideControlWeightReduction(const int num_rollouts, const int num_timesteps, const int sum_stride,
+__device__ bool strideControlWeightReduction(const int num_rollouts, const int num_timesteps, const int sum_stride,
                                              const int thread_idx, const int block_idx, const int control_dim,
                                              const float* __restrict__ exp_costs_d, const float normalizer,
                                              const float* __restrict__ du_d, float* __restrict__ u,
                                              float* __restrict__ u_intermediate)
 {
-  // int index = thread_idx * sum_stride + i;
+  bool has_weight = false;
   for (int i = 0; i < sum_stride; ++i)
   {  // Iterate through the size of the subsection
     if ((thread_idx * sum_stride + i) < num_rollouts)
@@ -1424,6 +1405,7 @@ __device__ void strideControlWeightReduction(const int num_rollouts, const int n
         // Do not read invalid controls: even zero * NaN would poison the weighted mean.
         continue;
       }
+      has_weight = true;
       for (int j = 0; j < control_dim; ++j)
       {  // Iterate through the control dimensions
         // Rollout index: (thread_idx*sum_stride + i)*(num_timesteps*control_dim)
@@ -1433,6 +1415,7 @@ __device__ void strideControlWeightReduction(const int num_rollouts, const int n
       }
     }
   }
+  return has_weight;
 }
 
 __device__ void rolloutWeightReductionAndSaveControl(int thread_idx, int block_idx, int num_rollouts, int num_timesteps,
@@ -1748,8 +1731,7 @@ void launchMinMaxWeightKernel(int num_rollouts, int blocksize_x, float* trajecto
   {
     threads *= 2;
   }
-  const size_t shared_bytes = static_cast<size_t>(threads) *
-                              (4U * sizeof(float) + sizeof(int));
+  const size_t shared_bytes = static_cast<size_t>(threads) * (6U * sizeof(float) + 2U * sizeof(int));
   minMaxWeightKernel<<<1, threads, shared_bytes, stream>>>(
       num_rollouts, trajectory_costs_d, rollout_crash_status_d, lambda_inv,
       normalization_percentile, range_epsilon, stats_d);

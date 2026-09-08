@@ -12,6 +12,16 @@
 #include <mppi/sampling_distributions/gaussian/gaussian.cuh>
 
 #include <vector>
+#include <stdexcept>
+
+/** No candidate from this control step may be applied; callers must use their fallback policy. */
+class NoEligibleRollouts : public std::runtime_error
+{
+public:
+  NoEligibleRollouts() : std::runtime_error("MPPI optimization failed: no finite, collision-free rollout weights")
+  {
+  }
+};
 
 template <class DYN_T, class COST_T, class FB_T, int MAX_TIMESTEPS, int NUM_ROLLOUTS,
           class SAMPLING_T = ::mppi::sampling_distributions::GaussianDistribution<typename DYN_T::DYN_PARAMS_T>,
@@ -109,6 +119,20 @@ public:
     return lastWeightStats().unsafe_rollout_fraction;
   }
 
+  int getLastEligibleRolloutCount() const
+  {
+    return lastWeightStats().eligible_count;
+  }
+  int getLastMinimumCostCount() const
+  {
+    return lastWeightStats().minimum_cost_count;
+  }
+  bool hasUnsafeRolloutPopulation() const
+  {
+    // Diagnostic only. Exploration/fallback decisions must not flatten safety weighting.
+    return getLastUnsafeRolloutFraction() >= unsafe_rollout_fraction_threshold_;
+  }
+
   float getLastUnnormalizedWeightSum() const
   {
     return lastWeightStats().normalizer;
@@ -116,6 +140,9 @@ public:
 
   /** Explicitly download the final normalized importance weights for debug consumers. */
   void downloadImportanceWeightsToHost();
+
+  /** Download exact final-iteration raw costs, including unsafe and nonfinite entries. */
+  std::vector<float> downloadRawRolloutCostsToHost();
 
 protected:
   /**
@@ -159,6 +186,8 @@ private:
   mppi::kernels::CostWeightStats* weight_stats_d_ = nullptr;
   /** One collision/safety flag per rollout, produced by the rollout cost kernel. */
   int* rollout_crash_status_d_ = nullptr;
+  float* raw_rollout_costs_d_ = nullptr;
+  bool raw_rollout_costs_valid_ = false;
   /** Pinned host mirror downloaded once after all optimization iterations complete. */
   mppi::kernels::CostWeightStats* weight_stats_h_ = nullptr;
   int weight_stats_capacity_ = 0;

@@ -410,8 +410,7 @@ public:
     }
     control_array result = u_ff + u_fb;
 
-    state_array empty_state = model_->getZeroState();
-    model_->enforceConstraints(empty_state, result);
+    model_->enforceConstraints(state, result);
 
     return result;
   }

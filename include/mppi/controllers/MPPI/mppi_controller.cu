@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -234,6 +235,8 @@ VANILLA_MPPI_TEMPLATE
 void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int optimization_stride)
 {
   const control_trajectory initial_control = this->control_;
+  failed_iteration_ = -1;
+  iteration_weight_stats_.clear();
   raw_rollout_costs_valid_ = false;
   this->free_energy_statistics_.real_sys.previousBaseline = this->getBaselineCost();
 
@@ -353,11 +356,18 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
     this->sampler_->setHostOptimalControlSequence(this->control_.data(), 0, true);
     device_optimal_control_ = this->control_;
     last_weight_stats_index_ = num_iterations - 1;
+    iteration_weight_stats_.assign(weight_stats_h_, weight_stats_h_ + num_iterations);
+    for (const auto& stats : iteration_weight_stats_)
+      iteration_effective_sample_sizes_.push_back(stats.effective_sample_size);
     for (int iteration = 0; iteration < num_iterations; ++iteration)
     {
       if (weight_stats_h_[iteration].eligible_count == 0 || !std::isfinite(weight_stats_h_[iteration].normalizer) ||
           weight_stats_h_[iteration].normalizer <= 0.0F)
       {
+        failed_iteration_ = iteration;
+        last_weight_stats_index_ = iteration;
+        this->setBaseline(weight_stats_h_[iteration].eligible_count > 0 ? weight_stats_h_[iteration].rollout_min_cost :
+                                                                          std::numeric_limits<float>::quiet_NaN());
         this->control_ = initial_control;
         device_optimal_control_ = initial_control;
         computeStateTrajectory(state);  // Diagnostic/validation replay of the preserved seed only.
@@ -383,7 +393,6 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
     {
       this->setBaseline(weight_stats.rollout_min_cost);
     }
-    iteration_effective_sample_sizes_.push_back(weight_stats.effective_sample_size);
 
     if (this->getBaselineCost() > baseline_prev + 1.0F)
     {
@@ -421,12 +430,24 @@ void VanillaMPPI::computeControl(const Eigen::Ref<const state_array>& state, int
   this->free_energy_statistics_.real_sys.increase =
       this->getBaselineCost() - this->free_energy_statistics_.real_sys.previousBaseline;
   smoothControlTrajectory();
-  computeStateTrajectory(state);
-  state_array zero_state = this->model_->getZeroState();
+  // Project the smoothed sequence with the same evolving state used by rollouts. Stateful
+  // constraints (for example steering-command rate and acceleration) cannot be evaluated against
+  // one placeholder zero state for every horizon sample.
+  state_array constraint_state = state;
+  state_array next_constraint_state = this->model_->getZeroState();
+  state_array constraint_derivative = this->model_->getZeroState();
+  output_array constraint_output = output_array::Zero();
   for (int i = 0; i < this->getNumTimesteps(); i++)
   {
-    this->model_->enforceConstraints(zero_state, this->control_.col(i));
+    this->model_->enforceConstraints(constraint_state, this->control_.col(i));
+    if (i + 1 < this->getNumTimesteps())
+    {
+      this->model_->step(constraint_state, next_constraint_state, constraint_derivative, this->control_.col(i),
+                         constraint_output, static_cast<float>(i), this->getDt());
+      constraint_state = next_constraint_state;
+    }
   }
+  computeStateTrajectory(state);
 
   // Copy back sampled trajectories
   {

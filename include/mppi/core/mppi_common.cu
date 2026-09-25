@@ -307,7 +307,8 @@ __global__ void rolloutCostKernel(const COST_T* __restrict__ costs, SAMPLING_T* 
     int rollout_crashed = 0;
     for (int time_thread = 0; time_thread < blockDim.x; ++time_thread)
     {
-      rollout_crashed |= crash_status_shared[thread_idz * blockDim.x + time_thread];
+      rollout_crashed =
+          mppi::safety::merge(rollout_crashed, crash_status_shared[thread_idz * blockDim.x + time_thread]);
     }
     crash_status_shared[thread_idz * blockDim.x] = rollout_crashed;
   }
@@ -903,7 +904,7 @@ __device__ void computeAndSaveCost(int num_rollouts, int num_timesteps, int glob
     if (rollout_crash_status_device != nullptr)
     {
       rollout_crash_status_device[global_idx + num_rollouts * threadIdx.z] =
-          crash_status != nullptr && crash_status[0] != 0 ? 1 : 0;
+          crash_status != nullptr ? crash_status[0] : 0;
     }
   }
 }
@@ -1055,12 +1056,18 @@ __global__ void minMaxWeightKernel(int num_rollouts, float* __restrict__ traject
   int* eligible_counts = reinterpret_cast<int*>(raw_cost_squared_sums + blockDim.x);
   int* finite_counts = eligible_counts + blockDim.x;
   __shared__ unsigned int unsafe_rollout_count;
+  __shared__ unsigned int reason_counts[3];
+  __shared__ int first_event;
   __shared__ unsigned int histogram[256];
   __shared__ unsigned int quantile_key;
   __shared__ int quantile_rank;
 
   if (threadIdx.x == 0)
+  {
     unsafe_rollout_count = 0U;
+    reason_counts[0] = reason_counts[1] = reason_counts[2] = 0U;
+    first_event = 0x7fffffff;
+  }
   __syncthreads();
   float local_min = FLT_MAX;
   float local_max = -FLT_MAX;
@@ -1071,10 +1078,19 @@ __global__ void minMaxWeightKernel(int num_rollouts, float* __restrict__ traject
   int local_eligible = 0;
   int local_finite = 0;
   unsigned int local_unsafe = 0U;
+  unsigned int local_reasons[3] = {};
+  int local_first_event = 0x7fffffff;
   for (int rollout = threadIdx.x; rollout < num_rollouts; rollout += blockDim.x)
   {
     const float cost = trajectory_costs_d[rollout];
-    const bool unsafe = rollout_crash_status_d != nullptr && rollout_crash_status_d[rollout] != 0;
+    const int status = rollout_crash_status_d != nullptr ? rollout_crash_status_d[rollout] : 0;
+    const bool unsafe = status != 0;
+    local_reasons[0] += (status & mppi::safety::kLateral) != 0;
+    local_reasons[1] += (status & mppi::safety::kObstacle) != 0;
+    local_reasons[2] += (status & mppi::safety::kRoadBorder) != 0;
+    const int event = status & ~mppi::safety::kReasonMask;
+    if (event != 0)
+      local_first_event = min(local_first_event, event);
     local_unsafe += unsafe ? 1U : 0U;
     if (!isfinite(cost))
       continue;
@@ -1100,6 +1116,11 @@ __global__ void minMaxWeightKernel(int num_rollouts, float* __restrict__ traject
   finite_counts[threadIdx.x] = local_finite;
   if (local_unsafe != 0U)
     atomicAdd(&unsafe_rollout_count, local_unsafe);
+  for (int reason = 0; reason < 3; ++reason)
+    if (local_reasons[reason] != 0U)
+      atomicAdd(&reason_counts[reason], local_reasons[reason]);
+  if (local_first_event != 0x7fffffff)
+    atomicMin(&first_event, local_first_event);
   __syncthreads();
   for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
   {
@@ -1235,6 +1256,11 @@ __global__ void minMaxWeightKernel(int num_rollouts, float* __restrict__ traject
     stats_d->raw_cost_squared_sum = raw_cost_squared_sum;
     stats_d->unsafe_rollout_fraction =
         num_rollouts > 0 ? static_cast<float>(unsafe_rollout_count) / num_rollouts : 0.0F;
+    stats_d->unsafe_count = static_cast<int>(unsafe_rollout_count);
+    stats_d->lateral_violation_count = static_cast<int>(reason_counts[0]);
+    stats_d->obstacle_violation_count = static_cast<int>(reason_counts[1]);
+    stats_d->road_border_violation_count = static_cast<int>(reason_counts[2]);
+    stats_d->first_violation_status = first_event == 0x7fffffff ? 0 : first_event;
     stats_d->finite_count = finite_count;
     stats_d->eligible_count = eligible_count;
     stats_d->minimum_cost_count = eligible_counts[0];

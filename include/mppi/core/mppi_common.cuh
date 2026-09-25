@@ -6,6 +6,7 @@
 #define MPPIGENERIC_MPPI_COMMON_CUH
 
 #include <mppi/utils/math_utils.h>
+#include <mppi/core/rollout_safety_status.cuh>
 
 namespace mppi
 {
@@ -30,6 +31,13 @@ struct CostWeightStats
   float raw_cost_squared_sum = 0.0F;
   /** Fraction of rollouts whose cost function reported a collision/safety violation. */
   float unsafe_rollout_fraction = 0.0F;
+  int unsafe_count = 0;
+  // Counts overlap: a rollout may violate several constraints and have a nonfinite cost.
+  int lateral_violation_count = 0;
+  int obstacle_violation_count = 0;
+  int road_border_violation_count = 0;
+  /** Earliest geometric safety event in this population; zero means unavailable. */
+  int first_violation_status = 0;
   int finite_count = 0;
   int eligible_count = 0;
   /** Number of eligible rollouts with normalized cost zero: the attainable ESS floor. */

@@ -37,6 +37,7 @@ public:
   using control_trajectory = typename PARENT_CLASS::control_trajectory;
   using state_trajectory = typename PARENT_CLASS::state_trajectory;
   using state_array = typename PARENT_CLASS::state_array;
+  using output_array = typename PARENT_CLASS::output_array;
   using sampled_cost_traj = typename PARENT_CLASS::sampled_cost_traj;
   using FEEDBACK_GPU = typename PARENT_CLASS::TEMPLATED_FEEDBACK_GPU;
 
@@ -119,6 +120,16 @@ public:
     return lastWeightStats().unsafe_rollout_fraction;
   }
 
+  /** Zero-based failed iteration, or -1 after a successful control step. */
+  int getFailedIteration() const
+  {
+    return failed_iteration_;
+  }
+  const std::vector<mppi::kernels::CostWeightStats>& getIterationWeightStats() const
+  {
+    return iteration_weight_stats_;
+  }
+
   int getLastEligibleRolloutCount() const
   {
     return lastWeightStats().eligible_count;
@@ -183,6 +194,8 @@ private:
     return weight_stats_h_[last_weight_stats_index_];
   }
 
+  int failed_iteration_ = -1;
+  std::vector<mppi::kernels::CostWeightStats> iteration_weight_stats_;
   mppi::kernels::CostWeightStats* weight_stats_d_ = nullptr;
   /** One collision/safety flag per rollout, produced by the rollout cost kernel. */
   int* rollout_crash_status_d_ = nullptr;

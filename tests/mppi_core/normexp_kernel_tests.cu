@@ -387,6 +387,42 @@ TEST_F(NormExpKernel, AllUnsafeOrNonFiniteCostsHaveNoEligibleWeight)
   }
 }
 
+TEST(RolloutSafetyStatus, MergeRetainsEarliestEventAndAllReasons)
+{
+  using namespace mppi::safety;
+  const int later = event(2, 9, 7);
+  const int earlier = event(3, 2, 4);
+  const int merged = merge(later, earlier);
+  EXPECT_EQ(merged, merge(earlier, later));
+  EXPECT_EQ(timestep(merged), 2);
+  EXPECT_EQ(reason(merged), 3);
+  EXPECT_EQ(geometryIndex(merged), 4);
+  EXPECT_NE(merged & kObstacle, 0);
+  EXPECT_NE(merged & kRoadBorder, 0);
+  EXPECT_EQ(merge(0, 1), 1);  // Legacy boolean costs remain supported.
+  EXPECT_EQ(timestep(merge(0, 1)), -1);
+  EXPECT_EQ(merge(merged, merged), merged);
+  EXPECT_EQ(merge(merge(later, earlier), event(1, 2)), merge(later, merge(earlier, event(1, 2))));
+}
+
+TEST_F(NormExpKernel, SafetyDiagnosticsCountOverlappingReasonsAndNonfiniteCosts)
+{
+  using namespace mppi::safety;
+  const int both = merge(event(2, 7, 3), event(3, 2, 5));
+  const auto result = safeWeights({ 1.0F, 2.0F, std::numeric_limits<float>::quiet_NaN(), 4.0F },
+                                  { both, event(1, 1), event(2, 3, 2), 0 });
+  EXPECT_EQ(result.stats.eligible_count, 1);
+  EXPECT_EQ(result.stats.finite_count, 3);
+  EXPECT_EQ(result.stats.unsafe_count, 3);
+  EXPECT_EQ(result.stats.lateral_violation_count, 1);
+  EXPECT_EQ(result.stats.obstacle_violation_count, 2);
+  EXPECT_EQ(result.stats.road_border_violation_count, 1);
+  EXPECT_EQ(timestep(result.stats.first_violation_status), 1);
+  EXPECT_EQ(reason(result.stats.first_violation_status), 1);
+  EXPECT_EQ(geometryIndex(result.stats.first_violation_status), -1);
+  EXPECT_FLOAT_EQ(result.weights[3], 1.0F);
+}
+
 TEST_F(NormExpKernel, ExactPercentileHandlesExtremeOutliersNegativeCostsAndEndpoints)
 {
   std::vector<float> costs(101);

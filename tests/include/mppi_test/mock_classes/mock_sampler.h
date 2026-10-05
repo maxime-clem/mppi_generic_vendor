@@ -23,7 +23,8 @@ public:
                void(const int& opt_stride, const int& iteration_num, curandGenerator_t& gen, bool synchronize));
   MOCK_METHOD3(setHostOptimalControlSequence,
                void(float* optimal_control_trajectory, const int& distribution_idx, bool synchronize));
-  MOCK_METHOD4(updateDistributionParamsFromDevice,
-               void(const float* trajectory_weights_d, float normalizer, const int& distribution_i, bool synchronize));
+  MOCK_METHOD5(updateDistributionParamsFromDevice,
+               void(const float* trajectory_weights_d, float normalizer, const int& distribution_i, bool synchronize,
+                    const float2* baseline_and_norm_d));
 };
 #endif  // MPPIGENERIC_TESTS_INCLUDE_MPPI_TEST_MOCK_CLASSES_MOCK_SAMPLER_H_

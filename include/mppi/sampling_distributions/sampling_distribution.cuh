@@ -407,12 +407,14 @@ public:
    * update)
    *
    * @param trajectory_weights_d - vector of weights of size num_rollouts located on the GPU
-   * @param normalizer - sum of all weights
+   * @param normalizer - sum of all weights (ignored when baseline_and_norm_d is non-null)
    * @param distribution_i - which distribution to update
    * @param synchronize - whether or not to run cudaStreamSynchronize
+   * @param baseline_and_norm_d - optional device pointer to baseline (.x) and normalizer (.y)
    */
   __host__ virtual void updateDistributionParamsFromDevice(const float* trajectory_weights_d, float normalizer,
-                                                           const int& distribution_i, bool synchronize = false) = 0;
+                                                           const int& distribution_i, bool synchronize = false,
+                                                           const float2* baseline_and_norm_d = nullptr) = 0;
 
   /**
    * @brief Update the device-side distribution without refreshing any host-side cache.

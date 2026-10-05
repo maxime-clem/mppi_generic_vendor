@@ -780,6 +780,37 @@ __global__ void weightedReductionKernel(const float* __restrict__ exp_costs_d, c
   __syncthreads();
 }
 
+template <int CONTROL_DIM>
+__global__ void weightedReductionKernelDeviceNorm(const float* __restrict__ exp_costs_d, const float* __restrict__ du_d,
+                                                  float* __restrict__ new_u_d,
+                                                  const float2* __restrict__ baseline_and_norm_d,
+                                                  const int baseline_norm_index, const int num_timesteps,
+                                                  const int num_rollouts, const int sum_stride)
+{
+  const float normalizer = baseline_and_norm_d[baseline_norm_index].y;
+  int thread_idx = threadIdx.x;
+  int block_idx = blockIdx.x;
+
+  extern __shared__ float u_intermediate[];
+
+  float u[CONTROL_DIM];
+  setInitialControlToZero(CONTROL_DIM, thread_idx, u, u_intermediate);
+
+  __syncthreads();
+
+  const bool has_weight = strideControlWeightReduction(num_rollouts, num_timesteps, sum_stride, thread_idx, block_idx,
+                                                       CONTROL_DIM, exp_costs_d, normalizer, du_d, u, u_intermediate);
+
+  // Preserve the previous mean when the device normalizer has no valid weight.
+  if (__syncthreads_count(has_weight) == 0)
+    return;
+
+  rolloutWeightReductionAndSaveControl(thread_idx, block_idx, num_rollouts, num_timesteps, CONTROL_DIM, sum_stride, u,
+                                       u_intermediate, new_u_d);
+
+  __syncthreads();
+}
+
 template <int CONTROL_DIM, int NUM_ROLLOUTS, int SUM_STRIDE>
 __global__ void weightedReductionKernel(float* exp_costs_d, float* du_d, float* du_new_d,
                                         float2* baseline_and_normalizer_d, int num_timesteps)
@@ -1712,6 +1743,24 @@ void launchWeightedReductionKernel(const float* __restrict__ exp_costs_d, const 
   unsigned shared_mem_size = math::nearest_multiple_4(CONTROL_DIM * dimBlock.x) * sizeof(float);
   weightedReductionKernel<CONTROL_DIM><<<dimGrid, dimBlock, shared_mem_size, stream>>>(
       exp_costs_d, du_d, new_u_d, normalizer, num_timesteps, num_rollouts, sum_stride);
+  HANDLE_ERROR(cudaGetLastError());
+  if (synchronize)
+  {
+    HANDLE_ERROR(cudaStreamSynchronize(stream));
+  }
+}
+
+template <int CONTROL_DIM>
+void launchWeightedReductionKernel(const float* __restrict__ exp_costs_d, const float* __restrict__ du_d,
+                                   float* __restrict__ new_u_d, const float2* __restrict__ baseline_and_norm_d,
+                                   const int baseline_norm_index, const int num_timesteps, const int num_rollouts,
+                                   const int sum_stride, cudaStream_t stream, bool synchronize)
+{
+  dim3 dimBlock(math::int_ceil(num_rollouts, sum_stride), 1, 1);
+  dim3 dimGrid(num_timesteps, 1, 1);
+  unsigned shared_mem_size = math::nearest_multiple_4(CONTROL_DIM * dimBlock.x) * sizeof(float);
+  weightedReductionKernelDeviceNorm<CONTROL_DIM><<<dimGrid, dimBlock, shared_mem_size, stream>>>(
+      exp_costs_d, du_d, new_u_d, baseline_and_norm_d, baseline_norm_index, num_timesteps, num_rollouts, sum_stride);
   HANDLE_ERROR(cudaGetLastError());
   if (synchronize)
   {

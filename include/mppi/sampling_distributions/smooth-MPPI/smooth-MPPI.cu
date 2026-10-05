@@ -202,10 +202,10 @@ __host__ void SMOOTH_MPPI_NOISE::generateSamples(const int& optimization_stride,
 
 SMOOTH_MPPI_TEMPLATE
 __host__ void SMOOTH_MPPI_NOISE::updateDistributionParamsFromDevice(const float* trajectory_weights_d, float normalizer,
-                                                                    const int& distribution_i, bool synchronize)
+                                                                    const int& distribution_i, bool synchronize,
+                                                                    const float2* baseline_and_norm_d)
 {
-  updateDistributionParamsFromDeviceOnly(trajectory_weights_d, normalizer, distribution_i, false);
-  if (distribution_i >= this->getNumDistributions())
+  if (!updateDistributionParamsOnDevice(trajectory_weights_d, normalizer, distribution_i, false, baseline_and_norm_d))
   {
     return;
   }
@@ -225,19 +225,38 @@ __host__ void SMOOTH_MPPI_NOISE::updateDistributionParamsFromDeviceOnly(const fl
                                                                         const int& distribution_i,
                                                                         bool synchronize)
 {
+  updateDistributionParamsOnDevice(trajectory_weights_d, normalizer, distribution_i, synchronize, nullptr);
+}
+
+SMOOTH_MPPI_TEMPLATE
+__host__ bool SMOOTH_MPPI_NOISE::updateDistributionParamsOnDevice(const float* trajectory_weights_d,
+                                                                  float normalizer,
+                                                                  const int& distribution_i,
+                                                                  bool synchronize,
+                                                                  const float2* baseline_and_norm_d)
+{
   if (distribution_i >= this->getNumDistributions())
   {
     std::cerr << "Updating distributional params for distribution " << distribution_i << " out of "
               << this->getNumDistributions() << " total." << std::endl;
-    return;
+    return false;
   }
   int mean_index = distribution_i * this->getNumTimesteps() * this->CONTROL_DIM;
   int sample_index = distribution_i * this->getNumRollouts() * this->getNumTimesteps() * this->CONTROL_DIM;
   float* deriv_action_noise_i_d = &(this->deriv_action_noise_d_[sample_index]);
   float* deriv_action_mean_i_d = &(this->deriv_action_mean_d_[mean_index]);
-  mppi::kernels::launchWeightedReductionKernel<CONTROL_DIM>(
-      trajectory_weights_d, deriv_action_noise_i_d, deriv_action_mean_i_d, normalizer, this->getNumTimesteps(),
-      this->getNumRollouts(), this->params_.sum_strides, this->stream_, synchronize);
+  if (baseline_and_norm_d != nullptr)
+  {
+    mppi::kernels::launchWeightedReductionKernel<CONTROL_DIM>(
+        trajectory_weights_d, deriv_action_noise_i_d, deriv_action_mean_i_d, baseline_and_norm_d, distribution_i,
+        this->getNumTimesteps(), this->getNumRollouts(), this->params_.sum_strides, this->stream_, synchronize);
+  }
+  else
+  {
+    mppi::kernels::launchWeightedReductionKernel<CONTROL_DIM>(
+        trajectory_weights_d, deriv_action_noise_i_d, deriv_action_mean_i_d, normalizer, this->getNumTimesteps(),
+        this->getNumRollouts(), this->params_.sum_strides, this->stream_, synchronize);
+  }
   dim3 grid(1, 1, 1);
   dim3 block(1, this->CONTROL_DIM, 1);
   // std::cout << "Integrating optimal sequence" << std::endl;
@@ -252,6 +271,7 @@ __host__ void SMOOTH_MPPI_NOISE::updateDistributionParamsFromDeviceOnly(const fl
   {
     HANDLE_ERROR(cudaStreamSynchronize(this->stream_));
   }
+  return true;
 }
 
 // SMOOTH_MPPI_TEMPLATE

@@ -452,12 +452,28 @@ __host__ void GAUSSIAN_CLASS::generateSamples(const int& optimization_stride, co
 
 GAUSSIAN_TEMPLATE
 __host__ void GAUSSIAN_CLASS::updateDistributionParamsFromDevice(const float* trajectory_weights_d, float normalizer,
-                                                                 const int& distribution_i, bool synchronize)
+                                                                 const int& distribution_i, bool synchronize,
+                                                                 const float2* baseline_and_norm_d)
 {
-  updateDistributionParamsFromDeviceOnly(trajectory_weights_d, normalizer, distribution_i, false);
   if (distribution_i >= this->getNumDistributions())
   {
+    this->logger_->error(
+        "Updating distributional params for distribution %d out of %d total. Distribution out of bounds.\n",
+        distribution_i, this->getNumDistributions());
     return;
+  }
+  if (baseline_and_norm_d != nullptr)
+  {
+    float* control_samples_i_d =
+        &(this->control_samples_d_[distribution_i * this->getNumRollouts() * this->getNumTimesteps() * CONTROL_DIM]);
+    float* control_mean_i_d = &(this->control_means_d_[distribution_i * this->getNumTimesteps() * CONTROL_DIM]);
+    mppi::kernels::launchWeightedReductionKernel<CONTROL_DIM>(
+        trajectory_weights_d, control_samples_i_d, control_mean_i_d, baseline_and_norm_d, distribution_i,
+        this->getNumTimesteps(), this->getNumRollouts(), this->params_.sum_strides, this->stream_, false);
+  }
+  else
+  {
+    updateDistributionParamsFromDeviceOnly(trajectory_weights_d, normalizer, distribution_i, false);
   }
   float* control_mean_i_d = &(this->control_means_d_[distribution_i * this->getNumTimesteps() * CONTROL_DIM]);
   HANDLE_ERROR(cudaMemcpyAsync(&means_[distribution_i * this->getNumTimesteps() * CONTROL_DIM], control_mean_i_d,
